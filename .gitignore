@@ -163,3 +163,7 @@ cython_debug/
 
 # Virtual env
 myenv/
+
+# Ignore files starting with "yolo"
+yolo*
+
