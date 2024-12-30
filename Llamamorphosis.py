@@ -21,7 +21,23 @@ from ultralytics import YOLO, YOLOWorld
 from ollama import chat, ChatResponse
 import struct
 import random
+import math
+import select
 
+
+load_dotenv()
+
+TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+GUILD_ID = int(os.getenv('DISCORD_GUILD_ID', 0))
+CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', 0))
+
+intents = discord.Intents.default()
+intents.messages = True
+
+client_discord = discord.Client(intents=intents)
+guild = None
+channel = None
+what_ive_seen = []
 
 class COMMAND:
     CMD_MOVE = "CMD_MOVE"
@@ -41,8 +57,146 @@ class COMMAND:
     def __init__(self):
         pass
 
+
+# Unified video handling class
+class VideoHandler:
+    def __init__(self):
+        self.frame = None
+        self.recording = False
+        self.video_writer = None
+        self.recording_start_time = None
+        self.current_recording_file = None
+        self.video_flag = True
+
+    def process_frame(self, frame):
+        """Central method for processing incoming video frames"""
+        if frame is not None and isinstance(frame, np.ndarray):
+            self.frame = frame
+            if self.recording and self.video_writer is not None:
+                try:
+                    self.video_writer.write(frame)
+                except Exception as e:
+                    print(f"Error writing video frame: {e}")
+                    self.stop_recording()
+            return True
+        return False
+
+    def start_recording(self):
+        """Start video recording with proper validation"""
+        if not self.is_valid_frame():
+            print("No valid video frame available to start recording")
+            return None
+
+        try:
+            if self.recording:
+                print("Already recording. Stopping current recording first.")
+                self.stop_recording()
+
+            height, width = self.frame.shape[:2]
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.current_recording_file = f"recording_{timestamp}.avi"
+
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            self.video_writer = cv2.VideoWriter(
+                self.current_recording_file,
+                fourcc,
+                20.0,
+                (width, height)
+            )
+
+            if not self.video_writer.isOpened():
+                print("Failed to create video writer")
+                return None
+
+            print(f"Started recording to {self.current_recording_file}")
+            self.recording = True
+            self.recording_start_time = time.time()
+            return self.current_recording_file
+
+        except Exception as e:
+            self.cleanup_recording()
+            print(f"Error starting recording: {e}")
+            return None
+
+    def stop_recording(self):
+        """Stop recording and cleanup resources"""
+        duration = None
+        try:
+            if self.video_writer is not None and self.recording_start_time is not None:
+                duration = time.time() - self.recording_start_time
+                print("Releasing video writer...")
+                self.video_writer.release()
+                print(f"Video saved to: {self.current_recording_file}")
+        except Exception as e:
+            print(f"Error stopping recording: {e}")
+        finally:
+            self.cleanup_recording()
+        return duration
+
+    def cleanup_recording(self):
+        """Clean up recording resources"""
+        self.video_writer = None
+        self.recording = False
+        self.recording_start_time = None
+        self.current_recording_file = None
+
+    def is_valid_frame(self):
+        """Check if current frame is valid for processing"""
+        return (self.frame is not None and 
+                isinstance(self.frame, np.ndarray) and 
+                self.frame.size > 0)
+
+    def get_recording_duration(self):
+        """Get current recording duration in seconds"""
+        if self.recording and self.recording_start_time:
+            return time.time() - self.recording_start_time
+        return 0
+
+# Unified movement control class
+class MovementController:
+    def __init__(self, client):
+        self.client = client
+        self.last_movement = None
+        self.move_speed = "8"
+        self.movement_commands = {
+            'w': (0, 35),   # Forward
+            's': (0, -35),  # Backward
+            'a': (-35, 0),  # Left
+            'd': (35, 0)    # Right
+        }
+
+    def handle_movement(self, direction):
+        """Handle basic movement commands"""
+        if direction not in self.movement_commands:
+            return False
+
+        # Check obstacles for forward movement
+        if direction == 'w' and not self.client.is_path_clear():
+            print("Obstacle ahead, cannot move forward!")
+            self.stop_movement()
+            return False
+
+        x, y = self.movement_commands[direction]
+        self.last_movement = direction
+        command = f"CMD_MOVE#1#{x}#{y}#{self.move_speed}#0\n"
+        return self.client.send_command(command)
+
+    def handle_spin(self, direction):
+        """Handle spinning movement"""
+        angle = 10 if direction == 'right' else -10
+        command = f"CMD_MOVE#2#0#0#{self.move_speed}#{angle}\n"
+        return self.client.send_command(command)
+
+    def stop_movement(self):
+        """Stop all movement"""
+        command = f"CMD_MOVE#1#0#0#{self.move_speed}#0\n"
+        return self.client.send_command(command)
+
+# Updated InsectClient class
 class InsectClient:
     def __init__(self):
+        self.video_handler = VideoHandler()
+        self.movement_controller = MovementController(self)
         self.tcp_flag = False
         self.client_socket = None
         self.video_socket = None
@@ -56,7 +210,7 @@ class InsectClient:
         self.servo_power = True
         self.balance_mode = False
         self.head_position = {"vertical": 90, "horizontal": 90}
-        self.model = YOLO('yolov8m_ncnn_model')  # Adjust path if needed
+        # self.model = YOLO('yolov8m_ncnn_model')  # Adjust path if needed
         self.last_sonar_reading = float('inf')
         self.min_safe_distance = 20
         self.sonar_lock = threading.Lock()
@@ -67,6 +221,7 @@ class InsectClient:
 
         self.recording_start_time = None
         self.current_recording_file = None        
+        self.buzzing = None        
 
         # Add new attributes for path tracking
         self.exploration_path = []  # Store sequence of movements
@@ -129,11 +284,30 @@ class InsectClient:
 
             while self.tcp_flag:
                 try:
+                    # Read length bytes with timeout and size check
                     stream_bytes = self.connection.read(4)
-                    leng = struct.unpack('<L', stream_bytes[:4])
-                    jpg = self.connection.read(leng[0])
+                    if not stream_bytes or len(stream_bytes) != 4:
+                        print(f"Invalid stream bytes length: {len(stream_bytes) if stream_bytes else 0}")
+                        time.sleep(0.1)
+                        continue
+
+                    # Unpack length
+                    try:
+                        leng = struct.unpack('<L', stream_bytes)[0]
+                        if leng <= 0 or leng > 1000000:  # Sanity check on length
+                            print(f"Invalid frame length: {leng}")
+                            continue
+                    except struct.error as e:
+                        print(f"Error unpacking stream length: {e}")
+                        continue
+
+                    # Read frame data
+                    jpg = self.connection.read(leng)
+                    if len(jpg) != leng:
+                        print(f"Incomplete frame data. Expected {leng} bytes, got {len(jpg)}")
+                        continue
+
                     if self.is_valid_image_4_bytes(jpg):
-                        
                         if self.video_flag:
                             decoded_frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
                             if decoded_frame is not None:
@@ -149,9 +323,15 @@ class InsectClient:
                                         self.stop_recording()
                                 
                                 self.video_flag = False  # Indicate frame is being processed
-                            
+                            else:
+                                print("Failed to decode frame")
                         self.video_flag = True  # Reset flag for next frame
+                    else:
+                        print("Invalid JPEG data")
                         
+                except ConnectionError as e:
+                    print(f"Connection error in video stream: {e}")
+                    break
                 except Exception as e:
                     print(f"Error processing video frame: {e}")
                     continue
@@ -163,6 +343,12 @@ class InsectClient:
             # Ensure video writer is properly closed
             if self.recording:
                 self.stop_recording()
+            # Clean up connection
+            try:
+                if self.connection:
+                    self.connection.close()
+            except:
+                pass
 
     def stop_recording(self):
         """Stop recording and ensure proper cleanup."""
@@ -259,16 +445,39 @@ class InsectClient:
         print(f"Minimum safe distance set to {self.min_safe_distance}cm")
 
     def send_command(self, command):
+        """Send command to robot and receive response."""
         if self.tcp_flag:
             try:
+                # Send the command
                 self.client_socket.send(command.encode('utf-8'))
-                return True
+                
+                # Set socket to non-blocking temporarily
+                self.client_socket.setblocking(0)
+                
+                # Wait for response with timeout
+                ready = select.select([self.client_socket], [], [], 0.5)  # 0.5 second timeout
+                
+                if ready[0]:
+                    # Socket has data
+                    try:
+                        response = self.client_socket.recv(1024).decode('utf-8')
+                        return response.strip()
+                    except socket.error as e:
+                        print(f"Error receiving response: {e}")
+                        return None
+                else:
+                    print("No response received (timeout)")
+                    return None
+                
             except Exception as e:
                 print(f"Failed to send command: {e}")
-                return False
+                return None
+            finally:
+                # Reset socket to blocking mode
+                self.client_socket.setblocking(1)
         else:
             print("Not connected to robot")
-            return False
+            return None
 
     def disconnect(self):
         self.tcp_flag = False
@@ -344,44 +553,62 @@ class InsectClient:
         return (x, y)
 
     async def random_explore(self):
-        """Performs intelligent random exploration with spinning."""
+        """Performs exploration by spinning randomly and moving forward."""
         if not self.tcp_flag or not self.servo_power:
             return
 
-        # First, decide if we should spin
-        if random.random() < self.spin_probability:
-            # Choose a random spin angle
-            spin_angle = random.uniform(-self.max_spin_angle, self.max_spin_angle)
+        try:
+            # First spin a random amount
+            spin_angle = random.uniform(-180, 180)  # Full range of rotation
             command = f"CMD_MOVE#2#0#0#8#{spin_angle}\n"
             self.send_command(command)
-            await asyncio.sleep(abs(spin_angle) / 45)  # Adjust sleep based on spin angle
-            self.update_position(('spin', spin_angle), abs(spin_angle) / 45)
-            self.send_command("CMD_MOVE#1#0#0#8#0\n")  # Stop spinning
+            
+            # Wait for spin to complete - scale wait time with angle
+            spin_duration = abs(spin_angle) / 45  # Adjust this value based on actual robot speed
+            await asyncio.sleep(spin_duration)
+            
+            # Update position to track the spin
+            self.update_position(('spin', spin_angle), spin_duration)
+            
+            # Stop spinning
+            self.send_command("CMD_MOVE#1#0#0#8#0\n")
             await asyncio.sleep(0.5)  # Brief pause after spin
 
-        # Get unvisited directions
-        available_moves = self.get_unvisited_directions()
-        
-        # If all adjacent cells have been visited, choose any valid movement
-        if not available_moves:
-            available_moves = ['w', 's', 'a', 'd']
-            if not self.is_path_clear():
-                available_moves.remove('w')  # Remove forward movement if obstacle detected
-
-        if available_moves:
-            movement = random.choice(available_moves)
-            x, y = 0, 0
-            if movement == 'w': y = 35
-            elif movement == 's': y = -35
-            elif movement == 'a': x = -35
-            elif movement == 'd': x = 35
-
-            command = f"CMD_MOVE#1#{x}#{y}#8#0\n"
-            self.send_command(command)
-            await asyncio.sleep(self.exploration_duration)
-            self.update_position((movement, None), self.exploration_duration)
-            self.send_command("CMD_MOVE#1#0#0#8#0\n") 
+            # Check if path is clear before moving forward
+            if self.is_path_clear():
+                # Move forward
+                command = f"CMD_MOVE#1#0#35#8#0\n"  # Forward movement
+                self.send_command(command)
+                await asyncio.sleep(self.exploration_duration)
+                
+                # Update position with forward movement
+                self.update_position(('w', None), self.exploration_duration)
+                
+                # Stop movement
+                self.send_command("CMD_MOVE#1#0#0#8#0\n")
+            else:
+                print("Obstacle detected, skipping forward movement")
+                
+            # Add current position to visited cells
+            cell = (int(self.position[0] / self.grid_resolution),
+                int(self.position[1] / self.grid_resolution))
+            self.visited_cells.add(cell)
             
+            # Store movement in path
+            self.exploration_path.append({
+                'movement': 'explore',
+                'spin_angle': spin_angle,
+                'moved_forward': self.is_path_clear(),
+                'position': self.position,
+                'orientation': self.orientation,
+                'timestamp': time.time()
+            })
+
+        except Exception as e:
+            print(f"Error during exploration: {e}")
+            # Ensure robot stops on error
+            self.send_command("CMD_MOVE#1#0#0#8#0\n")            
+    
     def start_exploration(self):
         """Enables random exploration mode."""
         self.exploring = True
@@ -455,6 +682,14 @@ class InsectControl:
         command = f"{self.cmd.CMD_SONIC}\n"
         self.client.send_command(command)
 
+    def toogle_buzz(self):
+        self.client.buzzing = not self.client.buzzing
+        if self.client.buzzing:
+            command = f"{self.cmd.CMD_BUZZER}#0\n"
+        else:
+            command = f"{self.cmd.CMD_BUZZER}#1\n"
+        self.client.send_command(command)
+
     def toggle_balance(self):
         self.client.balance_mode = not self.client.balance_mode
         command = f"{self.cmd.CMD_BALANCE}#{1 if self.client.balance_mode else 0}\n"
@@ -517,92 +752,6 @@ class InsectControl:
         else:
             print("No detections available (YOLO disabled or no objects detected)")
 
-    def main_loop(self):
-
-        self.print_help()
-        
-        while self.running:
-            try:
-                cmd = input("Enter command: ").lower()
-                
-                if cmd in ['w', 'a', 's', 'd']:
-                    self.handle_movement(cmd)
-                elif cmd == ' ':  # space key
-                    self.stop_movement()
-                elif cmd == 'r':
-                    self.toggle_servo_power()
-                elif cmd == 'b':
-                    self.toggle_balance()
-                elif cmd == 'n':
-                    self.get_sonar()
-                elif cmd.startswith('sd'):  # Set minimum safe distance
-                    try:
-                        distance = int(cmd[2:])
-                        self.client.set_min_safe_distance(distance)
-                    except ValueError:
-                        print("Invalid distance. Usage: sd30 (sets safe distance to 30cm)")
-                elif cmd == 'z':
-                    command = f"{self.cmd.CMD_BUZZER}#1\n"
-                    self.client.send_command(command)
-                elif cmd == 't':
-                    self.move_head('up')
-                elif cmd == 'g':
-                    self.move_head('down')
-                elif cmd == 'f':
-                    self.move_head('left')
-                elif cmd == 'h':
-                    self.move_head('right')
-                elif cmd == 'l':
-                    self.custom_led()
-                elif cmd == 'm':
-                    self.cycle_led_mode()
-                elif cmd == 'c':
-                    self.get_power_status()
-                elif cmd == 'v':
-                    if not self.client.recording:
-                        self.client.start_recording()
-                    else:
-                        self.client.stop_recording()
-                elif cmd == 'p':
-                    self.show_preview()
-                elif cmd == 'y':
-                    self.client.yolo_enabled = not self.client.yolo_enabled
-                    print(f"YOLO detection {'enabled' if self.client.yolo_enabled else 'disabled'}")
-                elif cmd == 'o':
-                    self.print_detections()
-                elif cmd == 'h':
-                    self.print_help()
-                elif cmd == 'q':
-                    self.running = False
-                elif cmd.isdigit() and 1 <= int(cmd) <= 9:
-                    self.client.move_speed = cmd
-                    print(f"Speed set to {cmd}")
-                else:
-                    print("Unknown command. Type 'h' for help")
-
-            except KeyboardInterrupt:
-                self.running = False
-            except Exception as e:
-                print(f"Error: {e}")
-
-        cv2.destroyAllWindows()
-        self.client.disconnect()
-
-
-
-load_dotenv()
-
-TOKEN = os.getenv('DISCORD_BOT_TOKEN')
-GUILD_ID = int(os.getenv('DISCORD_GUILD_ID', 0))
-CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', 0))
-
-intents = discord.Intents.default()
-intents.messages = True
-
-client_discord = discord.Client(intents=intents)
-guild = None
-channel = None
-what_ive_seen = []
 
 async def post(guild, channel, message):
     if channel:
@@ -653,10 +802,10 @@ async def run_basic_detection(insect_controller):
         print(f"Error in basic detection: {e}")
         return None
 
-async def run_realtime_detection(classes, guild, channel, insect_controller):
+async def run_realtime_detection(classes, guild, channel, insect_controller, config):
     print("Starting realtime detection...")
     
-    model_world = YOLOWorld('yolov8s-worldv2')
+    model_world = YOLOWorld(config.yolo.world_model, task='detect')
     if classes:
         model_world.set_classes(classes)
     COLORS = np.random.uniform(0, 255, size=(1, 3))
@@ -763,10 +912,35 @@ class ConfigManager:
         self.robot = RobotSettings()
         self.yolo = YOLOSettings()
         self.discord = DiscordSettings.from_env()
-        
+        self.explore = False
+        self.discord_integration = False
+        self.video_enabled = True
+        self.detection_enabled = False
+
         if self.config_path.exists():
             self.load_config()
-    
+
+    def print_config(self):
+        """Print the current configuration settings."""
+        print("Robot Settings:")
+        for key, value in self.robot.__dict__.items():
+            print(f"  {key}: {value}")
+        
+        print("\nYOLO Settings:")
+        for key, value in self.yolo.__dict__.items():
+            print(f"  {key}: {value}")
+        
+        print("\nDiscord Settings:")
+        for key, value in self.discord.__dict__.items():
+            print(f"  {key}: {value}")
+
+        print("\nAdditional Settings:")
+        print(f"  Explore: {self.explore}")
+        print(f"  Discord Integration: {self.discord_integration}")
+        print(f"  Video Enabled: {self.video_enabled}")
+        print(f"  Detection Enabled: {self.detection_enabled}")
+
+
     def load_config(self):
         """Load configuration from JSON file."""
         try:
@@ -774,6 +948,10 @@ class ConfigManager:
                 config = json.load(f)
                 self.robot = RobotSettings(**config.get('robot', {}))
                 self.yolo = YOLOSettings(**config.get('yolo', {}))
+                self.explore = config.get('explore', self.explore)
+                self.discord_integration = config.get('discord_integration', self.discord_integration)
+                self.video_enabled = config.get('video_enabled', self.video_enabled)
+                self.detection_enabled = config.get('detection_enabled', self.detection_enabled)
         except Exception as e:
             print(f"Error loading config: {e}")
     
@@ -781,7 +959,11 @@ class ConfigManager:
         """Save current configuration to JSON file."""
         config = {
             'robot': self.robot.__dict__,
-            'yolo': self.yolo.__dict__
+            'yolo': self.yolo.__dict__,
+            'explore': self.explore,
+            'discord_integration': self.discord_integration,
+            'video_enabled': self.video_enabled,
+            'detection_enabled': self.detection_enabled
         }
         with open(self.config_path, 'w') as f:
             json.dump(config, f, indent=4)
@@ -806,11 +988,42 @@ class KeyboardController:
             'r': ('Toggle servo power', self.control.toggle_servo_power),
             'b': ('Toggle balance mode', self.control.toggle_balance),
             'x': ('Toggle exploration mode', self.toggle_exploration),
+            'n': ('Toggle sonar', self.control.get_sonar),
+            'z': ('Buzz', self.control.buzz),
             'v': ('Toggle video recording mode', self.toggle_video_recording),
+            'y': ('Preview', self.toggle_yolo),
+            'o': ('Print detections', self.print_detections),
+            'h': ('Print help', self.print_help),
+            'c': ('Get power status', self.control.get_power_status),
+            'p': ('Preview', self.control.show_preview),
+            '+': ('Increase speed', self.increase_speed),
+            '-': ('Decrease speed', self.decrease_speed),
             '!': ('Quit', self.quit),
             'esc': ('Quit', self.quit)
         }
         self.running = True
+
+
+    def increase_speed(self):
+        """Increase the robot's speed by one unit, ensuring it stays within the valid range."""
+        current_speed = int(self.control.client.move_speed)
+        if current_speed < 9:
+            self.control.client.move_speed = str(current_speed + 1)
+            print(f"Speed increased to {self.control.client.move_speed}")
+        else:
+            print("Speed is already at maximum")
+
+
+    def decrease_speed(self):
+        """Decrease the robot's speed by one unit, ensuring it stays within the valid range."""
+        current_speed = int(self.control.client.move_speed)
+        if current_speed > 1:
+            self.control.client.move_speed = str(current_speed - 1)
+            print(f"Speed decreased to {self.control.client.move_speed}")
+        else:
+            print("Speed is already at minimum")
+
+    
         
     def handle_keypress(self, key):
         """Handle key press events including escape key."""
@@ -821,11 +1034,14 @@ class KeyboardController:
             _, func = self.commands[key]
             if key in ['w', 'a', 's', 'd']:
                 func(key)
+            elif key in ['sd']:
+                func(key)
             else:
                 func()
             return True
         return False
     
+
     def print_help(self):
         """Display available commands."""
         print("\nAvailable commands:")
@@ -902,6 +1118,7 @@ class KeyboardController:
                     func()
             elif cmd == 'h':
                 self.print_help()
+
     def format_duration(self, seconds):
         """Format duration in seconds to HH:MM:SS format."""
         hours = int(seconds // 3600)
@@ -938,6 +1155,11 @@ class KeyboardController:
 
         except Exception as e:
             print(f"[{current_time}] ❌ Error toggling video recording: {e}")
+    
+    def toggle_yolo(self):
+        self.client.yolo_enabled = not self.client.yolo_enabled
+        print(f"YOLO detection {'enabled' if self.client.yolo_enabled else 'disabled'}")
+
 
     async def display_recording_status(self):
         """Periodically display recording duration in the preview window."""
@@ -977,7 +1199,7 @@ class KeyboardController:
             await asyncio.sleep(0.1)  # Update every 100ms
 
             
-def setup_discord(settings: DiscordSettings, insect_controller: 'InsectControl') -> Optional[discord.Client]:
+def setup_discord(settings: DiscordSettings, insect_controller: 'InsectControl', config) -> Optional[discord.Client]:
     """Initialize Discord client with given settings."""
     if not all([settings.token, settings.guild_id, settings.channel_id]):
         print("Incomplete Discord settings, skipping Discord integration")
@@ -998,7 +1220,7 @@ def setup_discord(settings: DiscordSettings, insect_controller: 'InsectControl')
                 await channel.send('*Bzzzzzzzt-click-click-brrzzztt! 🤖⚙️🐜🐝🕷️*')
                 # Start the detection loop with Discord integration
                 if insect_controller.client.yolo_enabled:
-                    await run_realtime_detection([], guild, channel, insect_controller)
+                    await run_realtime_detection([], guild, channel, insect_controller, config)
             else:
                 print('Discord channel not found!')
         else:
@@ -1028,8 +1250,18 @@ async def main():
     # Load configuration
     config = ConfigManager(args.config)
     
+    # Override config settings with command line arguments
+    config.explore = args.explore
+    config.discord_integration = args.discord
+    config.video_enabled = not args.no_video
+    config.detection_enabled = args.detection
+    config.print_config()
+    # quit()
+
+
     # Initialize robot controller
     insect_controller = InsectControl()
+
     
     # Connect to robot
     if not insect_controller.client.connect(config.robot.ip_address,
@@ -1046,20 +1278,20 @@ async def main():
         tasks = [keyboard.input_loop()]
         
         # Add video preview task if video is enabled
-        if not args.no_video:
+        if config.video_enabled:
             tasks.append(keyboard.preview_loop())
             tasks.append(keyboard.display_recording_status())
         
-        if args.explore:
+        if config.explore:
             insect_controller.client.start_exploration()
             tasks.append(insect_controller.manage_exploration())
         
-        if args.detection:
+        if config.detection:
             insect_controller.client.yolo_enabled = True
             tasks.append(run_realtime_detection([], None, None, insect_controller))
         
-        if args.discord:
-            discord_client = setup_discord(config.discord, insect_controller)
+        if config.discord:
+            discord_client = setup_discord(config.discord, insect_controller, config)
             if discord_client:
                 tasks.append(discord_client.start(config.discord.token))
         
