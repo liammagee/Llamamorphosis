@@ -9,31 +9,31 @@ notifications.
 
 ## Table of Contents
 
-1.  [Overview](#overview){rel="noopener"}
-2.  [Features](#features){rel="noopener"}
-3.  [Requirements](#requirements){rel="noopener"}
-4.  [Installation](#installation){rel="noopener"}
-5.  [Configuration](#configuration){rel="noopener"}
+1.  [Overview](#overview)
+2.  [Features](#features)
+3.  [Requirements](#requirements)
+4.  [Installation](#installation)
+5.  [Configuration](#configuration)
     -   [Config File
-        (`config``.json`)](#config-file-configjson){rel="noopener"}
+        (`config``.json`)](#config-file-configjson)
     -   [Environment Variables (Discord
-        Integration)](#environment-variables-discord-integration){rel="noopener"}
-6.  [Usage](#usage){rel="noopener"}
+        Integration)](#environment-variables-discord-integration)
+6.  [Usage](#usage)
     -   [Command-line
-        Arguments](#command-line-arguments){rel="noopener"}
-    -   [Keyboard Controls](#keyboard-controls){rel="noopener"}
-7.  [Classes & Modules](#classes--modules){rel="noopener"}
-    -   [InsectClient](#insectclient){rel="noopener"}
-    -   [InsectControl](#insectcontrol){rel="noopener"}
-    -   [ConfigManager](#configmanager){rel="noopener"}
-    -   [KeyboardController](#keyboardcontroller){rel="noopener"}
-    -   [Discord Integration](#discord-integration){rel="noopener"}
-8.  [Autonomous Exploration](#autonomous-exploration){rel="noopener"}
+        Arguments](#command-line-arguments)
+    -   [Keyboard Controls](#keyboard-controls)
+7.  [Classes & Modules](#classes--modules)
+    -   [InsectClient](#insectclient)
+    -   [InsectControl](#insectcontrol)
+    -   [ConfigManager](#configmanager)
+    -   [KeyboardController](#keyboardcontroller)
+    -   [Discord Integration](#discord-integration)
+8.  [Autonomous Exploration](#autonomous-exploration)
 9.  [YOLO-based Object
-    Detection](#yolo-based-object-detection){rel="noopener"}
-10. [Running the Code](#running-the-code){rel="noopener"}
-11. [Contributing](#contributing){rel="noopener"}
-12. [License](#license){rel="noopener"}
+    Detection](#yolo-based-object-detection)
+10. [Running the Code](#running-the-code)
+11. [Contributing](#contributing)
+12. [License](#license)
 
 ------------------------------------------------------------------------
 
