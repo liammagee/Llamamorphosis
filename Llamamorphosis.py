@@ -65,6 +65,9 @@ class InsectClient:
         self.exploration_interval = 5  # seconds between exploration moves
         self.exploration_duration = 2  # seconds per move
 
+        self.recording_start_time = None
+        self.current_recording_file = None        
+
         # Add new attributes for path tracking
         self.exploration_path = []  # Store sequence of movements
         self.position = (0, 0)  # Track relative position (x, y)
@@ -126,15 +129,27 @@ class InsectClient:
 
             while self.tcp_flag:
                 try:
-                    stream_bytes= self.connection.read(4)
-                    leng=struct.unpack('<L', stream_bytes[:4])
-                    jpg=self.connection.read(leng[0])
+                    stream_bytes = self.connection.read(4)
+                    leng = struct.unpack('<L', stream_bytes[:4])
+                    jpg = self.connection.read(leng[0])
                     if self.is_valid_image_4_bytes(jpg):
                         
                         if self.video_flag:
-                            self.frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                            self.image = self.frame
-                            self.video_flag = False  # Indicate frame is being processed
+                            decoded_frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                            if decoded_frame is not None:
+                                self.frame = decoded_frame
+                                self.image = self.frame
+                                
+                                # Write frame if recording
+                                if self.recording and self.video_writer is not None:
+                                    try:
+                                        self.video_writer.write(self.frame)
+                                    except Exception as e:
+                                        print(f"Error writing video frame: {e}")
+                                        self.stop_recording()
+                                
+                                self.video_flag = False  # Indicate frame is being processed
+                            
                         self.video_flag = True  # Reset flag for next frame
                         
                 except Exception as e:
@@ -145,27 +160,75 @@ class InsectClient:
             print(f"Video reception error: {e}")
         finally:
             print("Video reception stopped")
+            # Ensure video writer is properly closed
             if self.recording:
                 self.stop_recording()
 
-    def start_recording(self):
-        if self.frame is not None:
-            height, width = self.frame.shape[:2]
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"recording_{timestamp}.avi"
-            fourcc = cv2.VideoWriter_fourcc(*'XVID')
-            self.video_writer = cv2.VideoWriter(filename, fourcc, 20.0, (width, height))
-            self.recording = True
-            print(f"Started recording to {filename}")
-        else:
-            print("No video frame available to start recording")
-
     def stop_recording(self):
-        if self.video_writer:
-            self.video_writer.release()
+        """Stop recording and ensure proper cleanup."""
+        duration = None
+        try:
+            if self.video_writer is not None and self.recording_start_time is not None:
+                duration = time.time() - self.recording_start_time
+                print("Releasing video writer...")
+                self.video_writer.release()
+                print(f"Video saved to: {self.current_recording_file}")
+        except Exception as e:
+            print(f"Error stopping recording: {e}")
+        finally:
             self.video_writer = None
             self.recording = False
-            print("Stopped recording")
+            self.recording_start_time = None
+        return duration
+
+    def start_recording(self):
+        """Start recording video with proper frame validation."""
+        if self.frame is None or not isinstance(self.frame, np.ndarray) or self.frame.size == 0:
+            print("No valid video frame available to start recording")
+            return None
+            
+        try:
+            if self.recording:
+                print("Already recording. Stopping current recording first.")
+                self.stop_recording()
+                
+            height, width = self.frame.shape[:2]
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.current_recording_file = f"recording_{timestamp}.avi"
+            
+            # Use MJPG codec for better compatibility
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            self.video_writer = cv2.VideoWriter(
+                self.current_recording_file,
+                fourcc,
+                20.0,  # FPS
+                (width, height)
+            )
+            
+            if not self.video_writer.isOpened():
+                print("Failed to create video writer")
+                return None
+                
+            print(f"Started recording to {self.current_recording_file}")
+            self.recording = True
+            self.recording_start_time = time.time()
+            return self.current_recording_file
+        except Exception as e:
+            print(f"Error starting recording: {e}")
+            if self.video_writer is not None:
+                self.video_writer.release()
+            self.recording = False
+            self.recording_start_time = None
+            self.current_recording_file = None
+            self.video_writer = None
+            return None
+
+    def get_recording_duration(self):
+        """Get current recording duration in seconds."""
+        if self.recording and self.recording_start_time:
+            return time.time() - self.recording_start_time
+        return 0
+    
 
     def monitor_sonar(self):
         while self.tcp_flag:
@@ -743,6 +806,7 @@ class KeyboardController:
             'r': ('Toggle servo power', self.control.toggle_servo_power),
             'b': ('Toggle balance mode', self.control.toggle_balance),
             'x': ('Toggle exploration mode', self.toggle_exploration),
+            'v': ('Toggle video recording mode', self.toggle_video_recording),
             '!': ('Quit', self.quit),
             'esc': ('Quit', self.quit)
         }
@@ -814,6 +878,7 @@ class KeyboardController:
                     # print(f"Video FPS: {fps:.1f}")
                 
                 cv2.imshow('Insect Robot Video', self.control.client.frame)
+                
                 key = cv2.waitKey(1) & 0xFF
                 if key == 27:  # ESC key
                     self.quit()
@@ -837,7 +902,81 @@ class KeyboardController:
                     func()
             elif cmd == 'h':
                 self.print_help()
+    def format_duration(self, seconds):
+        """Format duration in seconds to HH:MM:SS format."""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        seconds = int(seconds % 60)
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
 
+    def toggle_video_recording(self):
+        """Toggle video recording state with enhanced feedback."""
+        current_time = datetime.now().strftime("%H:%M:%S")
+
+        # Proper frame check
+        if self.control.client.frame is None or not isinstance(self.control.client.frame, np.ndarray):
+            print(f"[{current_time}] ❌ Error: No video feed available. Cannot start recording.")
+            return
+
+        try:
+            if not self.control.client.recording:
+                # Start recording
+                filename = self.control.client.start_recording()
+                if filename:
+                    print(f"[{current_time}] 📹 Recording started")
+                    print(f"📁 Saving to: {filename}")
+            else:
+                # Stop recording and get duration
+                duration = self.control.client.stop_recording()
+                if duration:
+                    formatted_duration = self.format_duration(duration)
+                    print(f"[{current_time}] ⏹️ Recording stopped")
+                    print(f"⏱️ Duration: {formatted_duration}")
+                    print(f"💾 Saved as: {self.control.client.current_recording_file}")
+
+        except Exception as e:
+            print(f"[{current_time}] ❌ Error toggling video recording: {e}")
+
+    async def display_recording_status(self):
+        """Periodically display recording duration in the preview window."""
+        while self.running:
+            try:
+                # Proper frame check for recording status display
+                if (self.control.client.recording and 
+                    self.control.client.frame is not None and 
+                    isinstance(self.control.client.frame, np.ndarray) and 
+                    self.control.client.frame.size > 0):
+                    
+                    try:
+                        frame = self.control.client.frame.copy()
+                        duration = self.control.client.get_recording_duration()
+                        formatted_duration = self.format_duration(duration)
+                        
+                        # Add recording indicator and duration to frame
+                        cv2.putText(frame, 
+                                f"REC {formatted_duration}", 
+                                (10, 30),  # Position in top-left
+                                cv2.FONT_HERSHEY_SIMPLEX, 
+                                1,  # Font scale
+                                (0, 0, 255),  # Red color
+                                2)  # Thickness
+                        
+                        # Display red circle for recording indicator
+                        cv2.circle(frame, (35, 25), 8, (0, 0, 255), -1)
+                        
+                        cv2.imshow('Insect Robot Video', frame)
+                    except Exception as e:
+                        print(f"Error modifying/displaying frame: {e}")
+                        continue
+                
+            except Exception as e:
+                print(f"Error in recording status display: {e}")
+                
+            await asyncio.sleep(0.1)  # Update every 100ms
+
+            
 def setup_discord(settings: DiscordSettings, insect_controller: 'InsectControl') -> Optional[discord.Client]:
     """Initialize Discord client with given settings."""
     if not all([settings.token, settings.guild_id, settings.channel_id]):
@@ -909,6 +1048,7 @@ async def main():
         # Add video preview task if video is enabled
         if not args.no_video:
             tasks.append(keyboard.preview_loop())
+            tasks.append(keyboard.display_recording_status())
         
         if args.explore:
             insect_controller.client.start_exploration()
