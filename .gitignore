@@ -163,3 +163,9 @@ cython_debug/
 
 # Virtual env
 myenv/
+
+# Yolo weights
+*.pt
+*.torchscript
+*_model/
+
