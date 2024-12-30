@@ -72,7 +72,7 @@ class InsectClient:
         self.grid_resolution = 50  # cm per grid cell
         self.visited_cells = set()  # Track visited grid cells
         self.spin_probability = 0.3  # 30% chance to spin before moving
-        self.max_spin_ang
+        self.max_spin_ang = 90
 
 
     def connect(self, ip, port=5002, video_port=8002):
@@ -743,6 +743,7 @@ class KeyboardController:
             'r': ('Toggle servo power', self.control.toggle_servo_power),
             'b': ('Toggle balance mode', self.control.toggle_balance),
             'x': ('Toggle exploration mode', self.toggle_exploration),
+            '!': ('Quit', self.quit),
             'esc': ('Quit', self.quit)
         }
         self.running = True
