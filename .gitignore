@@ -169,3 +169,5 @@ myenv/
 *.torchscript
 *_model/
 
+# Ignore *.avi
+*.avi

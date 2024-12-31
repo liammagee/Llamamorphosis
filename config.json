@@ -1,0 +1,51 @@
+{
+  "robot": {
+      "ip_address": "10.0.0.250",
+      "control_port": 5002,
+      "video_port": 8002,
+      "move_speed": 8,
+      "min_safe_distance": 20.0,
+      "exploration_interval": 5.0,
+      "exploration_duration": 2.0,
+      "head_default_vertical": 90,
+      "head_default_horizontal": 90
+  },
+  "yolo": {
+      "base_model": "yolov8s",
+      "world_model": "yolov8s-worldv2",
+      "confidence_threshold": 0.5,
+      "iou_threshold": 0.45
+  },
+  "discord": {
+      "token": "",
+      "guild_id": null,
+      "channel_id": null
+  },
+  "video": {
+      "recording": {
+          "fps": 20,
+          "codec": "MJPG",
+          "default_filename_prefix": "recording"
+      },
+      "preview": {
+          "enabled": true,
+          "window_title": "Insect Robot Video"
+      }
+  },
+  "safety": {
+      "max_speed": 9,
+      "min_speed": 1,
+      "emergency_stop_distance": 10.0,
+      "battery_warning_threshold": 20
+  },
+  "movement": {
+      "default_spin_angle": 10,
+      "grid_resolution": 50,
+      "spin_probability": 0.3,
+      "max_spin_angle": 90
+  },
+  "explore": true,
+  "discord_integration": false,
+  "video_enabled": true,
+  "detection_enabled": false
+}

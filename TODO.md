@@ -3,7 +3,6 @@
 ## 📝 To Do
 - [ ] Check object detection
 - [ ] Video recording (with object detection)
-- [ ] Update README
 
 
 ## 🔄 In Progress
@@ -13,3 +12,4 @@
 - [x] Git update
 - [x] Proper quit
 - [x] Video recording
+- [x] Update README
