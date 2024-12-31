@@ -58,145 +58,9 @@ class COMMAND:
         pass
 
 
-# Unified video handling class
-class VideoHandler:
-    def __init__(self):
-        self.frame = None
-        self.recording = False
-        self.video_writer = None
-        self.recording_start_time = None
-        self.current_recording_file = None
-        self.video_flag = True
-
-    def process_frame(self, frame):
-        """Central method for processing incoming video frames"""
-        if frame is not None and isinstance(frame, np.ndarray):
-            self.frame = frame
-            if self.recording and self.video_writer is not None:
-                try:
-                    self.video_writer.write(frame)
-                except Exception as e:
-                    print(f"Error writing video frame: {e}")
-                    self.stop_recording()
-            return True
-        return False
-
-    def start_recording(self):
-        """Start video recording with proper validation"""
-        if not self.is_valid_frame():
-            print("No valid video frame available to start recording")
-            return None
-
-        try:
-            if self.recording:
-                print("Already recording. Stopping current recording first.")
-                self.stop_recording()
-
-            height, width = self.frame.shape[:2]
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            self.current_recording_file = f"recording_{timestamp}.avi"
-
-            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-            self.video_writer = cv2.VideoWriter(
-                self.current_recording_file,
-                fourcc,
-                20.0,
-                (width, height)
-            )
-
-            if not self.video_writer.isOpened():
-                print("Failed to create video writer")
-                return None
-
-            print(f"Started recording to {self.current_recording_file}")
-            self.recording = True
-            self.recording_start_time = time.time()
-            return self.current_recording_file
-
-        except Exception as e:
-            self.cleanup_recording()
-            print(f"Error starting recording: {e}")
-            return None
-
-    def stop_recording(self):
-        """Stop recording and cleanup resources"""
-        duration = None
-        try:
-            if self.video_writer is not None and self.recording_start_time is not None:
-                duration = time.time() - self.recording_start_time
-                print("Releasing video writer...")
-                self.video_writer.release()
-                print(f"Video saved to: {self.current_recording_file}")
-        except Exception as e:
-            print(f"Error stopping recording: {e}")
-        finally:
-            self.cleanup_recording()
-        return duration
-
-    def cleanup_recording(self):
-        """Clean up recording resources"""
-        self.video_writer = None
-        self.recording = False
-        self.recording_start_time = None
-        self.current_recording_file = None
-
-    def is_valid_frame(self):
-        """Check if current frame is valid for processing"""
-        return (self.frame is not None and 
-                isinstance(self.frame, np.ndarray) and 
-                self.frame.size > 0)
-
-    def get_recording_duration(self):
-        """Get current recording duration in seconds"""
-        if self.recording and self.recording_start_time:
-            return time.time() - self.recording_start_time
-        return 0
-
-# Unified movement control class
-class MovementController:
-    def __init__(self, client):
-        self.client = client
-        self.last_movement = None
-        self.move_speed = "8"
-        self.movement_commands = {
-            'w': (0, 35),   # Forward
-            's': (0, -35),  # Backward
-            'a': (-35, 0),  # Left
-            'd': (35, 0)    # Right
-        }
-
-    def handle_movement(self, direction):
-        """Handle basic movement commands"""
-        if direction not in self.movement_commands:
-            return False
-
-        # Check obstacles for forward movement
-        if direction == 'w' and not self.client.is_path_clear():
-            print("Obstacle ahead, cannot move forward!")
-            self.stop_movement()
-            return False
-
-        x, y = self.movement_commands[direction]
-        self.last_movement = direction
-        command = f"CMD_MOVE#1#{x}#{y}#{self.move_speed}#0\n"
-        return self.client.send_command(command)
-
-    def handle_spin(self, direction):
-        """Handle spinning movement"""
-        angle = 10 if direction == 'right' else -10
-        command = f"CMD_MOVE#2#0#0#{self.move_speed}#{angle}\n"
-        return self.client.send_command(command)
-
-    def stop_movement(self):
-        """Stop all movement"""
-        command = f"CMD_MOVE#1#0#0#{self.move_speed}#0\n"
-        return self.client.send_command(command)
-
 # Updated InsectClient class
 class InsectClient:
     def __init__(self):
-        self.video_handler = VideoHandler()
-        self.movement_controller = MovementController(self)
         self.tcp_flag = False
         self.client_socket = None
         self.video_socket = None
@@ -234,9 +98,12 @@ class InsectClient:
 
 
     def connect(self, ip, port=5002, video_port=8002):
+        self.last_connection_params = (ip, port, video_port)
+
         # Close any existing connections first
         self.disconnect()
-        
+
+
         try:
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client_socket.connect((ip, port))
@@ -251,8 +118,8 @@ class InsectClient:
             self.video_thread = threading.Thread(target=self.receive_video, daemon=True)
             self.video_thread.start()
             
-            self.sonar_thread = threading.Thread(target=self.monitor_sonar, daemon=True)
-            self.sonar_thread.start()
+            # self.sonar_thread = threading.Thread(target=self.monitor_sonar, daemon=True)
+            # self.sonar_thread.start()
             
             return True
         except Exception as e:
@@ -446,7 +313,17 @@ class InsectClient:
 
     def send_command(self, command):
         """Send command to robot and receive response."""
-        if self.tcp_flag:
+
+        print(f"Sending command: {command.strip()}")  # Log the command being sent
+        
+        if not self.tcp_flag or not self.client_socket:
+            print("Not connected to robot")
+            return None
+            
+        try:
+            # Store original blocking state
+            original_blocking = self.client_socket.getblocking()
+            
             try:
                 # Send the command
                 self.client_socket.send(command.encode('utf-8'))
@@ -459,25 +336,31 @@ class InsectClient:
                 
                 if ready[0]:
                     # Socket has data
-                    try:
-                        response = self.client_socket.recv(1024).decode('utf-8')
-                        return response.strip()
-                    except socket.error as e:
-                        print(f"Error receiving response: {e}")
-                        return None
+                    response = self.client_socket.recv(1024).decode('utf-8')
+                    return response.strip()
                 else:
-                    print("No response received (timeout)")
+                    # print("No response received (timeout)")
                     return None
-                
-            except Exception as e:
-                print(f"Failed to send command: {e}")
-                return None
+                    
             finally:
-                # Reset socket to blocking mode
-                self.client_socket.setblocking(1)
-        else:
-            print("Not connected to robot")
+                # Always restore original blocking state
+                if original_blocking != self.client_socket.getblocking():
+                    self.client_socket.setblocking(original_blocking)
+                    
+        except socket.error as e:
+            if e.errno == 9:  # Bad file descriptor
+                print("Socket is in invalid state, attempting to reconnect...")
+                self.tcp_flag = False
+                # Attempt to reconnect using last known good IP and ports
+                if hasattr(self, 'last_connection_params'):
+                    self.connect(*self.last_connection_params)
+            else:
+                print(f"Socket error: {e}")
             return None
+        except Exception as e:
+            print(f"Failed to send command: {e}")
+            return None
+
 
     def disconnect(self):
         self.tcp_flag = False
@@ -559,7 +442,7 @@ class InsectClient:
 
         try:
             # First spin a random amount
-            spin_angle = random.uniform(-180, 180)  # Full range of rotation
+            spin_angle = random.randint(-90, 90)  # Full range of rotation
             command = f"CMD_MOVE#2#0#0#8#{spin_angle}\n"
             self.send_command(command)
             
@@ -682,7 +565,7 @@ class InsectControl:
         command = f"{self.cmd.CMD_SONIC}\n"
         self.client.send_command(command)
 
-    def toogle_buzz(self):
+    def toggle_buzz(self):
         self.client.buzzing = not self.client.buzzing
         if self.client.buzzing:
             command = f"{self.cmd.CMD_BUZZER}#0\n"
@@ -989,11 +872,11 @@ class KeyboardController:
             'b': ('Toggle balance mode', self.control.toggle_balance),
             'x': ('Toggle exploration mode', self.toggle_exploration),
             'n': ('Toggle sonar', self.control.get_sonar),
-            'z': ('Buzz', self.control.buzz),
+            'z': ('Buzz', self.control.toggle_buzz),
             'v': ('Toggle video recording mode', self.toggle_video_recording),
             'y': ('Preview', self.toggle_yolo),
-            'o': ('Print detections', self.print_detections),
-            'h': ('Print help', self.print_help),
+            'o': ('Print detections', self.control.print_detections),
+            '?y': ('Print help', self.print_help),
             'c': ('Get power status', self.control.get_power_status),
             'p': ('Preview', self.control.show_preview),
             '+': ('Increase speed', self.increase_speed),
@@ -1157,8 +1040,9 @@ class KeyboardController:
             print(f"[{current_time}] ❌ Error toggling video recording: {e}")
     
     def toggle_yolo(self):
-        self.client.yolo_enabled = not self.client.yolo_enabled
-        print(f"YOLO detection {'enabled' if self.client.yolo_enabled else 'disabled'}")
+        ### TODO: Move to InsectControl class
+        self.control.client.yolo_enabled = not self.control.client.yolo_enabled
+        print(f"YOLO detection {'enabled' if self.control.client.yolo_enabled else 'disabled'}")
 
 
     async def display_recording_status(self):
@@ -1243,6 +1127,7 @@ def parse_args():
                       help='Enable object detection')
     return parser.parse_args()
 
+
 async def main():
     # Parse command line arguments
     args = parse_args()
@@ -1250,18 +1135,16 @@ async def main():
     # Load configuration
     config = ConfigManager(args.config)
     
-    # Override config settings with command line arguments
-    config.explore = args.explore
-    config.discord_integration = args.discord
-    config.video_enabled = not args.no_video
-    config.detection_enabled = args.detection
+    # Use config values by default, fall back to CLI args if not set
+    config.explore = getattr(config, 'explore', False) or args.explore
+    config.discord_integration = getattr(config, 'discord_integration', False) or args.discord
+    config.video_enabled = getattr(config, 'video_enabled', True) and not args.no_video
+    config.detection_enabled = getattr(config, 'detection_enabled', False) or args.detection
     config.print_config()
-    # quit()
 
 
     # Initialize robot controller
     insect_controller = InsectControl()
-
     
     # Connect to robot
     if not insect_controller.client.connect(config.robot.ip_address,
@@ -1283,14 +1166,14 @@ async def main():
             tasks.append(keyboard.display_recording_status())
         
         if config.explore:
-            insect_controller.client.start_exploration()
+            # insect_controller.client.start_exploration()
             tasks.append(insect_controller.manage_exploration())
         
-        if config.detection:
+        if config.detection_enabled:
             insect_controller.client.yolo_enabled = True
             tasks.append(run_realtime_detection([], None, None, insect_controller))
         
-        if config.discord:
+        if config.discord_integration:
             discord_client = setup_discord(config.discord, insect_controller, config)
             if discord_client:
                 tasks.append(discord_client.start(config.discord.token))
@@ -1298,7 +1181,7 @@ async def main():
         # Run all tasks
         await asyncio.gather(*tasks)
         
-    except Exception as e:
+    except Exception as e: 
         print(f"Error in main loop: {e}")
     finally:
         insect_controller.client.disconnect()
