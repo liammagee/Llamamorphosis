@@ -1,6 +1,6 @@
 {
   "robot": {
-      "ip_address": "10.0.0.250",
+      "ip_address": "127.0.0.1",
       "control_port": 5002,
       "video_port": 8002,
       "move_speed": 8,
@@ -44,8 +44,8 @@
       "spin_probability": 0.3,
       "max_spin_angle": 90
   },
-  "explore": true,
-  "discord_integration": false,
+  "explore": false,
+  "discord_integration": true,
   "video_enabled": true,
-  "detection_enabled": false
+  "detection_enabled": true
 }

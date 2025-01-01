@@ -23,17 +23,19 @@ import struct
 import random
 import math
 import select
-
+import signal
+from discord import File
 
 load_dotenv()
 
+# Environment variables
 TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 GUILD_ID = int(os.getenv('DISCORD_GUILD_ID', 0))
 CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', 0))
 
+# Discord client setup
 intents = discord.Intents.default()
 intents.messages = True
-
 client_discord = discord.Client(intents=intents)
 guild = None
 channel = None
@@ -54,11 +56,8 @@ class COMMAND:
     CMD_CALIBRATION = "CMD_CALIBRATION"
     CMD_CAMERA = "CMD_CAMERA"
     CMD_SERVOPOWER = "CMD_SERVOPOWER"
-    def __init__(self):
-        pass
 
-
-# Updated InsectClient class
+# InsectClient class
 class InsectClient:
     def __init__(self):
         self.tcp_flag = False
@@ -74,53 +73,40 @@ class InsectClient:
         self.servo_power = True
         self.balance_mode = False
         self.head_position = {"vertical": 90, "horizontal": 90}
-        # self.model = YOLO('yolov8m_ncnn_model')  # Adjust path if needed
         self.last_sonar_reading = float('inf')
         self.min_safe_distance = 20
         self.sonar_lock = threading.Lock()
         self.exploring = False
         self.last_exploration_time = time.time()
-        self.exploration_interval = 5  # seconds between exploration moves
-        self.exploration_duration = 2  # seconds per move
-
+        self.exploration_interval = 5  
+        self.exploration_duration = 2  
         self.recording_start_time = None
         self.current_recording_file = None        
         self.buzzing = None        
-
-        # Add new attributes for path tracking
-        self.exploration_path = []  # Store sequence of movements
-        self.position = (0, 0)  # Track relative position (x, y)
-        self.orientation = 0  # Track orientation in degrees (0 = initial direction)
-        self.grid_resolution = 50  # cm per grid cell
-        self.visited_cells = set()  # Track visited grid cells
-        self.spin_probability = 0.3  # 30% chance to spin before moving
+        self.exploration_path = []  
+        self.position = (0, 0)  
+        self.orientation = 0  
+        self.grid_resolution = 50  
+        self.visited_cells = set()  
+        self.spin_probability = 0.3  
         self.max_spin_ang = 90
-
 
     def connect(self, ip, port=5002, video_port=8002):
         self.last_connection_params = (ip, port, video_port)
-
         # Close any existing connections first
         self.disconnect()
-
 
         try:
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client_socket.connect((ip, port))
             self.video_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.video_socket.connect((ip, video_port))
-
-                        
+            self.video_socket.connect((ip, video_port))                       
             self.tcp_flag = True
             print("Connected to insect robot!")
-            
-            # Start threads (optional if video/sonar needed)
             self.video_thread = threading.Thread(target=self.receive_video, daemon=True)
             self.video_thread.start()
-            
             # self.sonar_thread = threading.Thread(target=self.monitor_sonar, daemon=True)
             # self.sonar_thread.start()
-            
             return True
         except Exception as e:
             print(f"Connection failed: {e}")
@@ -508,7 +494,7 @@ class InsectControl:
         self.cmd = COMMAND()
         self.current_led_mode = 0
         self.last_movement = None
-        self.exploration_task = None
+        self.last_detection_time = 0 
 
     async def manage_exploration(self):
         """Manages random exploration behavior."""
@@ -687,42 +673,81 @@ async def run_basic_detection(insect_controller):
 
 async def run_realtime_detection(classes, guild, channel, insect_controller, config):
     print("Starting realtime detection...")
-    
-    model_world = YOLOWorld(config.yolo.world_model, task='detect')
+   
+    # Performance settings
+    FRAME_SKIP = 1  # Process every Nth frame
+    SCALE_FACTOR = 1.0 # 0.5  # Scale down frames by this factor (0.5 = half size)
+    PROCESS_INTERVAL = 0.1  # Minimum time between processing frames
+     
+    frame_count = 0
+    last_process_time = 0
+
+    model_world = YOLOWorld(config.yolo.world_model)
     if classes:
         model_world.set_classes(classes)
     COLORS = np.random.uniform(0, 255, size=(1, 3))
     
     try:
         while True:
+            current_time = time.time()
+            
+            # Skip if we're processing too frequently
+            if current_time - last_process_time < PROCESS_INTERVAL:
+                await asyncio.sleep(0.01)
+                continue
+            
             if insect_controller.client.frame is None:
                 await asyncio.sleep(0.1)
                 continue
                 
-            frame = insect_controller.client.frame.copy()  # Make a copy to avoid modifying the original
-            results = model_world(frame, stream=True, verbose=False)
+            frame_count += 1
             
+            if frame_count % FRAME_SKIP != 0:
+                # Show original frame without detection
+                if config.video_enabled:
+                    cv2.imshow('Real-time Object Detection', insect_controller.client.frame)
+                    # cv2.waitKey(1)
+                continue
+            
+            # Make a copy and resize for processing
+            original_frame = insect_controller.client.frame.copy()
+            if SCALE_FACTOR != 1.0:
+                height, width = original_frame.shape[:2]
+                new_width = int(width * SCALE_FACTOR)
+                new_height = int(height * SCALE_FACTOR)
+                process_frame = cv2.resize(original_frame, (new_width, new_height))
+            else:
+                process_frame = original_frame
+            original_frame = insect_controller.client.frame.copy()  # Make a copy to avoid modifying the original
+           
+            results = model_world(process_frame, stream=True, verbose=False)
+            display_frame = original_frame.copy()  # For drawing detections
+            post_image = False
+
             for r in results:
                 boxes = r.boxes
                 for box in boxes:
                     class_id = int(box.cls[0])
                     class_name = model_world.names[class_id]
-                    
-                    if class_name not in what_ive_seen:
-                        what_ive_seen.append(class_name)
-                        await post(guild, channel, f'I just saw {class_name}')
-                        response_to_object = await ollama_approach_flee_ignore(class_name)
-                        await post(guild, channel, f'I am going to {response_to_object}')
 
-                        # Integrate with Insect Robot:
-                        if response_to_object == "approach":
-                            insect_controller.handle_movement('w')  # Move forward
-                            await asyncio.sleep(1)  # Move for a second
-                            insect_controller.stop_movement()
-                        elif response_to_object == "flee":
-                            insect_controller.handle_movement('s')  # Move backward
-                            await asyncio.sleep(1)
-                            insect_controller.stop_movement()
+                    if config.discord_integration:
+                        if class_name not in what_ive_seen:
+                            if not post_image:
+                                post_image = True
+                            what_ive_seen.append(class_name)
+                            await post(guild, channel, f'I just saw {class_name}')
+                            response_to_object = await ollama_approach_flee_ignore(class_name)
+                            await post(guild, channel, f'I am going to {response_to_object}')
+
+                            # Integrate with Insect Robot:
+                            if response_to_object == "approach":
+                                insect_controller.handle_movement('w')  # Move forward
+                                await asyncio.sleep(1)  # Move for a second
+                                insect_controller.stop_movement()
+                            elif response_to_object == "flee":
+                                insect_controller.handle_movement('s')  # Move backward
+                                await asyncio.sleep(1)
+                                insect_controller.stop_movement()
                         
                         # Resume exploration after handling the object
                         await asyncio.sleep(2)
@@ -731,16 +756,31 @@ async def run_realtime_detection(classes, guild, channel, insect_controller, con
                     # Draw bounding box on frame
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     color = COLORS[0].tolist()
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
                     label = f'{class_name} {float(box.conf[0]):.2f}'
-                    cv2.putText(frame, label, (x1, y1 - 10),
+                    cv2.putText(display_frame, label, (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+            # Show processed frame
+            if config.video_enabled:
+                cv2.imshow('Real-time Object Detection', display_frame)
+                cv2.waitKey(1)                    
             
-            cv2.imshow('Real-time Object Detection', frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-            
-            await asyncio.sleep(0.1)  # Small delay to prevent CPU overuse
+            if config.discord_integration and channel and post_image:
+                # Save the current frame as an image
+                image_path = "current_frame.jpg"
+                cv2.imwrite(image_path, display_frame)
+
+                # Send the image to Discord
+                with open(image_path, 'rb') as f:
+                    discord_file = File(f)
+                    await channel.send(file=discord_file)
+
+                # Clean up the temporary image file
+                os.remove(image_path)            
+
+            last_process_time = current_time
+            await asyncio.sleep(0.01)  # Small delay to prevent CPU overuse
                 
     except KeyboardInterrupt:
         pass
@@ -851,11 +891,13 @@ class ConfigManager:
         with open(self.config_path, 'w') as f:
             json.dump(config, f, indent=4)
 
+
 class KeyboardController:
-    """Handles keyboard input for robot control."""
-    
-    def __init__(self, insect_control: 'InsectControl'):
+
+    def __init__(self, insect_control: 'InsectControl', active_tasks=None, discord_client=None):
         self.control = insect_control
+        self.active_tasks = active_tasks or []
+        self.discord_client = discord_client
         self.commands = {
             'w': ('Move forward', self.control.handle_movement),
             's': ('Move backward', self.control.handle_movement),
@@ -886,6 +928,33 @@ class KeyboardController:
         }
         self.running = True
 
+    def quit(self):
+        """Initiate graceful shutdown of all components."""
+        if not self.running:  # Prevent multiple quit calls
+            return
+            
+        print("\nInitiating shutdown...")
+        self.running = False
+
+        # Force stop all video windows
+        cv2.destroyAllWindows()
+
+        # Stop robot first
+        self.control.stop_movement()
+        self.control.client.tcp_flag = False  # Force stop video thread
+        
+        # Aggressively cancel all tasks
+        for task in self.active_tasks:
+            if not task.done():
+                task.cancel()
+        
+        # Stop the event loop
+        try:
+            loop = asyncio.get_running_loop()
+            loop.stop()
+        except Exception as e:
+            print(f"Error stopping event loop: {e}")
+        
 
     def increase_speed(self):
         """Increase the robot's speed by one unit, ensuring it stays within the valid range."""
@@ -936,31 +1005,6 @@ class KeyboardController:
             self.control.client.stop_exploration()
         else:
             self.control.client.start_exploration()
-    
-    def quit(self):
-        """Properly shut down all subsystems."""
-        print("Shutting down...")
-        
-        # Stop any active movement
-        self.control.stop_movement()
-        
-        # Stop exploration if active
-        if self.control.client.exploring:
-            self.control.client.stop_exploration()
-            
-        # Disconnect from robot
-        if self.control.client.tcp_flag:
-            if self.control.client.recording:
-                self.control.client.stop_recording()
-            self.control.client.disconnect()
-            
-        # Close any open windows
-        cv2.destroyAllWindows()
-        
-        # Set running to false to stop input loop
-        self.running = False
-        
-        print("Shutdown complete")
     
     async def preview_loop(self):
         """Continuously update video preview."""
@@ -1127,12 +1171,62 @@ def parse_args():
                       help='Enable object detection')
     return parser.parse_args()
 
+async def shutdown(tasks, insect_controller, discord_client):
+    """Handle graceful shutdown of all components."""
+    print("\nPerforming cleanup...")
+    
+    # Force stop all OpenCV windows first
+    cv2.destroyAllWindows()
+    
+    # Handle robot shutdown
+    if insect_controller:
+        try:
+            # Stop any movement
+            insect_controller.stop_movement()
+            
+            # Stop recording if active
+            if insect_controller.client.recording:
+                insect_controller.client.stop_recording()
+            
+            # Force video thread to stop
+            insect_controller.client.tcp_flag = False
+            
+            # Disconnect from robot
+            insect_controller.client.disconnect()
+        except Exception as e:
+            print(f"Error during robot cleanup: {e}")
+    
+    # Close Discord client
+    if discord_client:
+        try:
+            await discord_client.close()
+        except Exception as e:
+            print(f"Error closing Discord client: {e}")
+    
+    # Cancel all tasks immediately
+    for task in tasks:
+        try:
+            if not task.done():
+                task.cancel()
+        except Exception as e:
+            print(f"Error cancelling task: {e}")
+    
+    # Wait briefly for tasks to complete
+    if tasks:
+        try:
+            await asyncio.wait(tasks, timeout=0.5)
+        except Exception as e:
+            print(f"Error during task cleanup: {e}")
+    
+    # Stop the event loop
+    try:
+        loop = asyncio.get_running_loop()
+        loop.stop()
+    except Exception as e:
+        print(f"Error stopping event loop: {e}")
 
 async def main():
-    # Parse command line arguments
     args = parse_args()
-    
-    # Load configuration
     config = ConfigManager(args.config)
     
     # Use config values by default, fall back to CLI args if not set
@@ -1141,7 +1235,6 @@ async def main():
     config.video_enabled = getattr(config, 'video_enabled', True) and not args.no_video
     config.detection_enabled = getattr(config, 'detection_enabled', False) or args.detection
     config.print_config()
-
 
     # Initialize robot controller
     insect_controller = InsectControl()
@@ -1152,40 +1245,71 @@ async def main():
                                           config.robot.video_port):
         print("Failed to connect to robot")
         return
+
+    # Store tasks and clients for cleanup
+    active_tasks = set()
+    discord_client = None
+    keyboard = None
     
     try:
-        # Set up keyboard control
-        keyboard = KeyboardController(insect_controller)
+        # Set up keyboard control first
+        keyboard = KeyboardController(insect_controller, active_tasks, discord_client)
         
-        # Start tasks based on command line arguments
-        tasks = [keyboard.input_loop()]
-        
-        # Add video preview task if video is enabled
+        # Create and add tasks one by one
         if config.video_enabled:
-            tasks.append(keyboard.preview_loop())
-            tasks.append(keyboard.display_recording_status())
+            preview_task = asyncio.create_task(keyboard.preview_loop())
+            status_task = asyncio.create_task(keyboard.display_recording_status())
+            active_tasks.update({preview_task, status_task})
+        
+        input_task = asyncio.create_task(keyboard.input_loop())
+        active_tasks.add(input_task)
         
         if config.explore:
-            # insect_controller.client.start_exploration()
-            tasks.append(insect_controller.manage_exploration())
+            exploration_task = asyncio.create_task(insect_controller.manage_exploration())
+            active_tasks.add(exploration_task)
         
         if config.detection_enabled:
             insect_controller.client.yolo_enabled = True
-            tasks.append(run_realtime_detection([], None, None, insect_controller))
+            detection_task = asyncio.create_task(
+                run_realtime_detection([], None, None, insect_controller, config)
+            )
+            active_tasks.add(detection_task)
         
         if config.discord_integration:
             discord_client = setup_discord(config.discord, insect_controller, config)
             if discord_client:
-                tasks.append(discord_client.start(config.discord.token))
+                discord_task = asyncio.create_task(discord_client.start(config.discord.token))
+                active_tasks.add(discord_task)
+                keyboard.discord_client = discord_client  # Update keyboard's discord client
+
+        # Set up signal handlers
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, keyboard.quit)
         
-        # Run all tasks
-        await asyncio.gather(*tasks)
+        # Wait for completion or interruption
+        try:
+            await asyncio.gather(*active_tasks)
+        except asyncio.CancelledError:
+            print("Tasks cancelled")
+        except KeyboardInterrupt:
+            print("Keyboard interrupt received")
         
-    except Exception as e: 
+    except Exception as e:
         print(f"Error in main loop: {e}")
     finally:
-        insect_controller.client.disconnect()
-        cv2.destroyAllWindows()
+        if keyboard:
+            keyboard.quit()
+        await shutdown(active_tasks, insect_controller, discord_client)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"Fatal error: {e}")
+    finally:
+        # Force close any remaining windows
+        cv2.destroyAllWindows()
+        print("\nShutdown complete.")
