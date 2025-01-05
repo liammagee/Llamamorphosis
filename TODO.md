@@ -3,6 +3,7 @@
 ## 📝 To Do
 - [ ] Check object detection
 - [ ] Video recording (with object detection)
+- [ ] Record location
 
 
 ## 🔄 In Progress

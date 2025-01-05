@@ -8,7 +8,8 @@
       "exploration_interval": 5.0,
       "exploration_duration": 2.0,
       "head_default_vertical": 90,
-      "head_default_horizontal": 90
+      "head_default_horizontal": 90,
+      "sonar_interval": 1.0
   },
   "yolo": {
       "base_model": "yolov8s",
@@ -47,5 +48,6 @@
   "explore": false,
   "discord_integration": true,
   "video_enabled": true,
-  "detection_enabled": true
+  "detection_enabled": true,
+  "post_images": false
 }

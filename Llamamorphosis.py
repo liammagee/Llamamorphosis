@@ -57,6 +57,17 @@ class COMMAND:
     CMD_CAMERA = "CMD_CAMERA"
     CMD_SERVOPOWER = "CMD_SERVOPOWER"
 
+
+@dataclass
+class DetectionRecord:
+    """Records information about detected objects."""
+    object_class: str
+    timestamp: datetime
+    confidence: float
+    position: tuple  # (x, y) robot position
+    orientation: float  # robot orientation in degrees
+    frame_location: tuple  # (x, y) location in frame
+
 # InsectClient class
 class InsectClient:
     def __init__(self):
@@ -90,9 +101,30 @@ class InsectClient:
         self.visited_cells = set()  
         self.spin_probability = 0.3  
         self.max_spin_ang = 90
+        self.detection_history = []  # List of DetectionRecord objects      
+        self.sonar_interval = 1.0  
 
-    def connect(self, ip, port=5002, video_port=8002):
+    def print_detection_history(self):
+        """Print a summary of all detected objects with their timestamps and locations."""
+        if not self.detection_history:
+            print("No objects have been detected yet.")
+            return
+            
+        print("\nDetection History:")
+        print("-" * 80)
+        print(f"{'Time':12} | {'Object':15} | {'Confidence':10} | {'Position':15} | {'Orientation':10}")
+        print("-" * 80)
+        
+        for record in self.detection_history:
+            print(f"{record.timestamp.strftime('%H:%M:%S'):12} | "
+                f"{record.object_class:15} | "
+                f"{record.confidence:10.2f} | "
+                f"({record.position[0]:3.1f}, {record.position[1]:3.1f}) | "
+                f"{record.orientation:10.1f}°")
+        
+    def connect(self, ip, port=5002, video_port=8002, sonar_interval = 1.0):
         self.last_connection_params = (ip, port, video_port)
+        self.sonar_interval = sonar_interval
         # Close any existing connections first
         self.disconnect()
 
@@ -105,8 +137,8 @@ class InsectClient:
             print("Connected to insect robot!")
             self.video_thread = threading.Thread(target=self.receive_video, daemon=True)
             self.video_thread.start()
-            # self.sonar_thread = threading.Thread(target=self.monitor_sonar, daemon=True)
-            # self.sonar_thread.start()
+            self.sonar_thread = threading.Thread(target=self.monitor_sonar, daemon=True)
+            self.sonar_thread.start()
             return True
         except Exception as e:
             print(f"Connection failed: {e}")
@@ -270,14 +302,16 @@ class InsectClient:
     
 
     def monitor_sonar(self):
+        """Monitor sonar readings at configured interval."""
+        sonar_interval = getattr(self, 'sonar_interval', 1.0)  # Default to 1 second if not set
         while self.tcp_flag:
             try:
                 if self.client_socket:
                     self.send_command("CMD_SONIC\n")
-                    time.sleep(0.1)
+                    time.sleep(sonar_interval)
             except Exception as e:
                 print(f"Sonar monitoring error: {e}")
-                time.sleep(0.5)
+                time.sleep(0.5)  # Error recovery delay
 
     def process_sonar_response(self, data):
         try:
@@ -496,6 +530,7 @@ class InsectControl:
         self.last_movement = None
         self.last_detection_time = 0 
 
+
     async def manage_exploration(self):
         """Manages random exploration behavior."""
         while True:
@@ -525,8 +560,14 @@ class InsectControl:
             x = 35
 
         self.last_movement = direction
+        movement_start = time.time()
         command = f"{self.cmd.CMD_MOVE}#1#{x}#{y}#{self.client.move_speed}#0\n"
         self.client.send_command(command)
+        
+        # Store movement start time to calculate duration when movement stops
+        self.movement_start_time = movement_start
+        self.current_movement_direction = direction
+
 
     def handle_spin(self, direction):
         """Handle spinning movement."""
@@ -537,9 +578,19 @@ class InsectControl:
         self.client.send_command(command)
 
     def stop_movement(self):
-        # Send a stop command (for example: x=0, y=0)
+        if hasattr(self, 'movement_start_time') and hasattr(self, 'current_movement_direction'):
+            # Calculate actual movement duration
+            movement_duration = time.time() - self.movement_start_time
+            # Update position with actual duration
+            self.client.update_position((self.current_movement_direction, None), movement_duration)
+            # Clear movement tracking
+            self.movement_start_time = None
+            self.current_movement_direction = None
+        
+        # Send a stop command
         command = f"{self.cmd.CMD_MOVE}#1#0#0#{self.client.move_speed}#0\n"
         self.client.send_command(command)
+
 
     def toggle_servo_power(self):
         self.client.servo_power = not self.client.servo_power
@@ -626,7 +677,7 @@ async def post(guild, channel, message):
     if channel:
         await channel.send(message)
     else:
-        print('Guild not found!')
+        print('Guild not found when posting!')
 
 async def ollama_list(prompt):
     response: ChatResponse = chat(model='llama3.2:3b', messages=[
@@ -645,31 +696,6 @@ async def ollama_approach_flee_ignore(obj):
     },
     ])
     return response.message.content.strip().lower()
-
-async def run_basic_detection(insect_controller):
-    # Use robot's video feed instead of local camera
-    model = YOLO('yolov8s')
-    
-    try:
-        while True:
-            if insect_controller.client.frame is None:
-                await asyncio.sleep(0.1)
-                continue
-                
-            frame = insect_controller.client.frame
-            results = model(frame, stream=True, verbose=False)
-            for r in results:
-                boxes = r.boxes
-                for box in boxes:
-                    class_id = int(box.cls[0])
-                    class_name = model.names[class_id]
-                    return class_name
-                    
-            await asyncio.sleep(0.1)  # Small delay to prevent CPU overuse
-            
-    except Exception as e:
-        print(f"Error in basic detection: {e}")
-        return None
 
 async def run_realtime_detection(classes, guild, channel, insect_controller, config):
     print("Starting realtime detection...")
@@ -729,13 +755,32 @@ async def run_realtime_detection(classes, guild, channel, insect_controller, con
                 for box in boxes:
                     class_id = int(box.cls[0])
                     class_name = model_world.names[class_id]
+                    confidence = float(box.conf[0])
+                    
+                    # Get box center coordinates
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    frame_location = ((x1 + x2) // 2, (y1 + y2) // 2)
+                    
+                    # Create detection record
+                    detection = DetectionRecord(
+                        object_class=class_name,
+                        timestamp=datetime.now(),
+                        confidence=confidence,
+                        position=insect_controller.client.position,
+                        orientation=insect_controller.client.orientation,
+                        frame_location=frame_location
+                    )
 
-                    if config.discord_integration:
-                        if class_name not in what_ive_seen:
-                            if not post_image:
-                                post_image = True
-                            what_ive_seen.append(class_name)
-                            await post(guild, channel, f'I just saw {class_name}')
+                    # Add to history if it's a new object
+                    if class_name not in what_ive_seen:
+                        post_image = True
+                        insect_controller.client.detection_history.append(detection)
+                        what_ive_seen.append(class_name)
+                        
+                        if config.discord_integration:
+                            await post(guild, channel, 
+                                f'I just saw {class_name} at position {detection.position}, ' 
+                                f'orientation {detection.orientation:.1f}° at {detection.timestamp.strftime("%H:%M:%S")}')
                             response_to_object = await ollama_approach_flee_ignore(class_name)
                             await post(guild, channel, f'I am going to {response_to_object}')
 
@@ -766,7 +811,7 @@ async def run_realtime_detection(classes, guild, channel, insect_controller, con
                 cv2.imshow('Real-time Object Detection', display_frame)
                 cv2.waitKey(1)                    
             
-            if config.discord_integration and channel and post_image:
+            if config.discord_integration and channel and post_image and config.post_images:
                 # Save the current frame as an image
                 image_path = "current_frame.jpg"
                 cv2.imwrite(image_path, display_frame)
@@ -801,6 +846,8 @@ class RobotSettings:
     exploration_duration: float = 2.0
     head_default_vertical: int = 90
     head_default_horizontal: int = 90
+    sonar_interval: float = 1.0
+
 
 @dataclass
 class YOLOSettings:
@@ -839,6 +886,7 @@ class ConfigManager:
         self.discord_integration = False
         self.video_enabled = True
         self.detection_enabled = False
+        self.post_images = True
 
         if self.config_path.exists():
             self.load_config()
@@ -862,6 +910,7 @@ class ConfigManager:
         print(f"  Discord Integration: {self.discord_integration}")
         print(f"  Video Enabled: {self.video_enabled}")
         print(f"  Detection Enabled: {self.detection_enabled}")
+        print(f"  Post Images: {self.post_images}")
 
 
     def load_config(self):
@@ -875,6 +924,7 @@ class ConfigManager:
                 self.discord_integration = config.get('discord_integration', self.discord_integration)
                 self.video_enabled = config.get('video_enabled', self.video_enabled)
                 self.detection_enabled = config.get('detection_enabled', self.detection_enabled)
+                self.post_images = config.get('post_images', self.post_images)
         except Exception as e:
             print(f"Error loading config: {e}")
     
@@ -886,7 +936,8 @@ class ConfigManager:
             'explore': self.explore,
             'discord_integration': self.discord_integration,
             'video_enabled': self.video_enabled,
-            'detection_enabled': self.detection_enabled
+            'detection_enabled': self.detection_enabled,
+            'post_images': self.post_images
         }
         with open(self.config_path, 'w') as f:
             json.dump(config, f, indent=4)
@@ -921,6 +972,7 @@ class KeyboardController:
             '?y': ('Print help', self.print_help),
             'c': ('Get power status', self.control.get_power_status),
             'p': ('Preview', self.control.show_preview),
+            'l': ('Print detection history', lambda: self.control.client.print_detection_history()),
             '+': ('Increase speed', self.increase_speed),
             '-': ('Decrease speed', self.decrease_speed),
             '!': ('Quit', self.quit),
@@ -1126,7 +1178,6 @@ class KeyboardController:
                 
             await asyncio.sleep(0.1)  # Update every 100ms
 
-            
 def setup_discord(settings: DiscordSettings, insect_controller: 'InsectControl', config) -> Optional[discord.Client]:
     """Initialize Discord client with given settings."""
     if not all([settings.token, settings.guild_id, settings.channel_id]):
@@ -1136,25 +1187,48 @@ def setup_discord(settings: DiscordSettings, insect_controller: 'InsectControl',
     intents = discord.Intents.default()
     intents.messages = True
     client = discord.Client(intents=intents)
+    
+    # Create an event to signal when Discord is fully ready
+    discord_ready = asyncio.Event()
 
     @client.event
     async def on_ready():
         print(f'Logged in as {client.user}')
-        guild = discord.utils.get(client.guilds, id=settings.guild_id)
-        if guild:
-            print(f'Connected to guild: {guild.name}')
-            channel = discord.utils.get(guild.text_channels, id=settings.channel_id)
-            if channel:
-                await channel.send('*Bzzzzzzzt-click-click-brrzzztt! 🤖⚙️🐜🐝🕷️*')
-                # Start the detection loop with Discord integration
-                if insect_controller.client.yolo_enabled:
-                    await run_realtime_detection([], guild, channel, insect_controller, config)
-            else:
-                print('Discord channel not found!')
-        else:
-            print('Discord guild not found!')
+        
+        # Wait up to 3 seconds for guild to become available
+        guild = None
+        max_attempts = 6  # Try 6 times with 0.5s delay = 3 seconds total
+        for attempt in range(max_attempts):
+            guild = discord.utils.get(client.guilds, id=settings.guild_id)
+            if guild:
+                break
+            print(f"Waiting for guild... (attempt {attempt + 1}/{max_attempts})")
+            await asyncio.sleep(0.5)
+        
+        if not guild:
+            print("Discord guild not found after waiting! Check guild ID and permissions.")
+            return
+            
+        print(f'Connected to guild: {guild.name}')
+        
+        # Get channel
+        channel = discord.utils.get(guild.text_channels, id=settings.channel_id)
+        if not channel:
+            print('Discord channel not found! Check channel ID and permissions.')
+            return
+        
+        # Send startup message
+        try:
+            await channel.send('*Bzzzzzzzt-click-click-brrzzztt! 🤖⚙️🐜🐝🕷️*')
+            # Signal that Discord is ready
+            discord_ready.set()
+        except Exception as e:
+            print(f"Error sending Discord startup message: {e}")
 
+    # Store the ready event with the client
+    client.ready_event = discord_ready
     return client
+
 
 def parse_args():
     """Parse command line arguments."""
@@ -1169,6 +1243,8 @@ def parse_args():
                       help='Disable video feed')
     parser.add_argument('--detection', action='store_true',
                       help='Enable object detection')
+    parser.add_argument('--no-images', action='store_true',
+                      help='Disable posting images to Discord')    
     return parser.parse_args()
 
 async def shutdown(tasks, insect_controller, discord_client):
@@ -1234,6 +1310,7 @@ async def main():
     config.discord_integration = getattr(config, 'discord_integration', False) or args.discord
     config.video_enabled = getattr(config, 'video_enabled', True) and not args.no_video
     config.detection_enabled = getattr(config, 'detection_enabled', False) or args.detection
+    config.post_images = getattr(config, 'post_images', True) and not args.no_images
     config.print_config()
 
     # Initialize robot controller
@@ -1242,7 +1319,8 @@ async def main():
     # Connect to robot
     if not insect_controller.client.connect(config.robot.ip_address,
                                           config.robot.control_port,
-                                          config.robot.video_port):
+                                          config.robot.video_port,
+                                        config.robot.sonar_interval):
         print("Failed to connect to robot")
         return
 
@@ -1254,7 +1332,7 @@ async def main():
     try:
         # Set up keyboard control first
         keyboard = KeyboardController(insect_controller, active_tasks, discord_client)
-        
+
         # Create and add tasks one by one
         if config.video_enabled:
             preview_task = asyncio.create_task(keyboard.preview_loop())
@@ -1267,20 +1345,35 @@ async def main():
         if config.explore:
             exploration_task = asyncio.create_task(insect_controller.manage_exploration())
             active_tasks.add(exploration_task)
-        
-        if config.detection_enabled:
-            insect_controller.client.yolo_enabled = True
-            detection_task = asyncio.create_task(
-                run_realtime_detection([], None, None, insect_controller, config)
-            )
-            active_tasks.add(detection_task)
-        
+
+
+
+        # First set up Discord if enabled and wait for it to be ready
         if config.discord_integration:
             discord_client = setup_discord(config.discord, insect_controller, config)
             if discord_client:
                 discord_task = asyncio.create_task(discord_client.start(config.discord.token))
                 active_tasks.add(discord_task)
-                keyboard.discord_client = discord_client  # Update keyboard's discord client
+                keyboard.discord_client = discord_client
+                # Wait for Discord to be fully ready
+                await discord_client.ready_event.wait()
+
+
+        # Then set up detection after Discord is ready
+        if config.detection_enabled:
+            insect_controller.client.yolo_enabled = True
+            
+            discord_guild = None
+            discord_channel = None
+            if config.discord_integration and discord_client:
+                discord_guild = discord.utils.get(discord_client.guilds, id=config.discord.guild_id)
+                if discord_guild:
+                    discord_channel = discord.utils.get(discord_guild.text_channels, id=config.discord.channel_id)
+            
+            detection_task = asyncio.create_task(
+                run_realtime_detection([], discord_guild, discord_channel, insect_controller, config)
+            )
+            active_tasks.add(detection_task)
 
         # Set up signal handlers
         loop = asyncio.get_running_loop()
@@ -1312,4 +1405,4 @@ if __name__ == "__main__":
     finally:
         # Force close any remaining windows
         cv2.destroyAllWindows()
-        print("\nShutdown complete.")
+        print("\nShutdown complete.")   
