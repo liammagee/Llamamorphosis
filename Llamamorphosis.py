@@ -110,7 +110,9 @@ class InsectClient:
 
     def print_detection_history(self):
         """Print a summary of all detected objects with their timestamps and locations."""
-        print(self.get_detection_history_string())
+        history = self.get_detection_history_string()
+        print(history)
+        
         
     def get_detection_history_string(self):
         """Get a formatted string summary of all detected objects with timestamps and locations."""
@@ -694,7 +696,6 @@ async def post(guild, channel, message):
         print('Guild not found when posting!')
 
 
-
 async def ollama_approach_flee_ignore(obj):
     return await ollama_message(f'I am an insect. Given this object – {obj} – output a single word response: "approach", "flee" or "ignore".') 
 
@@ -989,8 +990,9 @@ class KeyboardController:
             '?': ('Print help', self.print_help),
             'c': ('Get power status', self.control.get_power_status),
             'p': ('Preview', self.control.show_preview),
-            'l': ('Print detection history', lambda: self.control.client.print_detection_history()),
+            'l': ('Print detection history', self.print_history),
             'm': ('Muse', self.muse),
+            'j': ('Jump around', self.jump_around),
             '+': ('Increase speed', self.increase_speed),
             '-': ('Decrease speed', self.decrease_speed),
             '!': ('Quit', self.quit),
@@ -1002,11 +1004,15 @@ class KeyboardController:
 
 
 
-    def create_prompt(self, client):
+    def create_prompt_for_reflection(self, client):
         """Create the full prompt for Claude."""
         records = client.get_detection_history_string()
         return f"""Reflect on the following record of your memories:\n\n{records}"""
 
+    def create_prompt_for_a_plan(self, client):
+        """Create the full prompt for Claude."""
+        records = client.get_detection_history_string()
+        return f"""Given the following record of your memories:\n\n{records}, generate a plan of action. This should include a sequence of horizontal movements that responds meaningfully to your memories of your world."""
 
 
     def get_claude_response(self, prompt):
@@ -1031,10 +1037,10 @@ class KeyboardController:
             return None
         
 
-    async def muse(self):
+    async def jump_around(self):
         """Send Claude's response to discord."""
         try:
-            memories = self.create_prompt(self.control.client)
+            memories = self.create_prompt_for_a_plan(self.control.client)
             # response = self.get_claude_response(memories)
             response = await ollama_message(memories)
             
@@ -1043,6 +1049,28 @@ class KeyboardController:
                 await post(self.guild, self.channel, response[0:2000])
         except Exception as e:
             print(f"Error in muse function: {e}")
+
+    async def muse(self):
+        """Send Claude's response to discord."""
+        try:
+            memories = self.create_prompt_for_reflection(self.control.client)
+            # response = self.get_claude_response(memories)
+            response = await ollama_message(memories)
+            
+            if response and self.guild and self.channel:
+                await post(self.guild, self.channel, memories[0:2000])
+                await post(self.guild, self.channel, response[0:2000])
+        except Exception as e:
+            print(f"Error in muse function: {e}")
+                        
+
+    async def print_history(self):
+        """Send Claude's response to discord."""
+        history = self.control.client.get_detection_history_string()
+        print(history)
+        await post(self.guild, self.channel, history[0:2000])
+
+        
             
     def register_discord(self, guild, channel):
         self.guild = guild
@@ -1252,26 +1280,25 @@ class KeyboardController:
                 
             await asyncio.sleep(0.1)  # Update every 100ms
 
-def setup_discord(settings: DiscordSettings, insect_controller: 'InsectControl', config) -> Optional[discord.Client]:
-    """Initialize Discord client with given settings."""
+def setup_discord(settings: DiscordSettings, insect_controller: 'InsectControl', keyboard_controller: 'KeyboardController', config) -> Optional[discord.Client]:
+    """Initialize Discord client with given settings and command handling."""
     if not all([settings.token, settings.guild_id, settings.channel_id]):
         print("Incomplete Discord settings, skipping Discord integration")
         return None
 
     intents = discord.Intents.default()
     intents.messages = True
+    intents.message_content = True
     client = discord.Client(intents=intents)
     
-    # Create an event to signal when Discord is fully ready
     discord_ready = asyncio.Event()
 
     @client.event
     async def on_ready():
         print(f'Logged in as {client.user}')
         
-        # Wait up to 3 seconds for guild to become available
         guild = None
-        max_attempts = 6  # Try 6 times with 0.5s delay = 3 seconds total
+        max_attempts = 6
         for attempt in range(max_attempts):
             guild = discord.utils.get(client.guilds, id=settings.guild_id)
             if guild:
@@ -1280,29 +1307,70 @@ def setup_discord(settings: DiscordSettings, insect_controller: 'InsectControl',
             await asyncio.sleep(0.5)
         
         if not guild:
-            print("Discord guild not found after waiting! Check guild ID and permissions.")
+            print("Discord guild not found after waiting!")
             return
             
         print(f'Connected to guild: {guild.name}')
         
-        # Get channel
         channel = discord.utils.get(guild.text_channels, id=settings.channel_id)
         if not channel:
-            print('Discord channel not found! Check channel ID and permissions.')
+            print('Discord channel not found!')
             return
         
-        # Send startup message
         try:
-            await channel.send('*Bzzzzzzzt-click-click-brrzzztt! 🤖⚙️🐜🐝🕷️*')
-            # Signal that Discord is ready
+            help_text = "Available commands:\n```\n"
+            for key, (desc, _) in keyboard_controller.commands.items():
+                if key not in ['esc', '!']:  # Skip certain commands
+                    help_text += f"{key} - {desc}\n"
+            help_text += "```"
+            
+            await channel.send('🤖 Robot control system online!\n' + help_text)
             discord_ready.set()
         except Exception as e:
             print(f"Error sending Discord startup message: {e}")
 
-    # Store the ready event with the client
+    @client.event
+    async def on_message(message):
+        # Ignore messages from the bot itself
+        if message.author == client.user:
+            return
+            
+        # Only process messages in the configured channel
+        if message.channel.id != settings.channel_id:
+            return
+            
+        # Get the command (single character)
+        cmd = message.content.strip().lower()
+        if len(cmd) >= 1:
+            cmd = cmd[0]  # Take first character as command
+            
+            if cmd in keyboard_controller.commands:
+                _, func = keyboard_controller.commands[cmd]
+                try:
+                    if inspect.iscoroutinefunction(func):
+                        await func()
+                    else:
+                        if cmd in ['w', 'a', 's', 'd']:
+                            func(cmd)
+                            # Auto-stop after 1 second for safety
+                            await asyncio.sleep(1)
+                            keyboard_controller.stop_movement()
+                        else:
+                            func()
+                    await message.channel.send(f"Executed command: {cmd}")
+                except Exception as e:
+                    await message.channel.send(f"Error executing command: {str(e)}")
+            elif cmd == '?':
+                # Show help
+                help_text = "Available commands:\n```\n"
+                for key, (desc, _) in keyboard_controller.commands.items():
+                    if key not in ['esc', '!']:  # Skip certain commands
+                        help_text += f"{key} - {desc}\n"
+                help_text += "```"
+                await message.channel.send(help_text)
+
     client.ready_event = discord_ready
     return client
-
 
 def parse_args():
     """Parse command line arguments."""
@@ -1377,7 +1445,6 @@ async def shutdown(tasks, insect_controller, discord_client):
 
     print("Shutdown complete.")
 
-
 async def main():
     args = parse_args()
     config = ConfigManager(args.config)
@@ -1387,17 +1454,7 @@ async def main():
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY not found in environment variables")
 
-    anthropic = Anthropic(api_key=api_key)
-
-
-
-    # Use config values by default, fall back to CLI args if not set
-    config.explore = getattr(config, 'explore', False) or args.explore
-    config.discord_integration = getattr(config, 'discord_integration', False) or args.discord
-    config.video_enabled = getattr(config, 'video_enabled', True) and not args.no_video
-    config.detection_enabled = getattr(config, 'detection_enabled', False) or args.detection
-    config.post_images = getattr(config, 'post_images', True) and not args.no_images
-    config.print_config()
+    anthropic_client = Anthropic(api_key=api_key)
 
     # Initialize robot controller
     insect_controller = InsectControl()
@@ -1406,20 +1463,20 @@ async def main():
     if not insect_controller.client.connect(config.robot.ip_address,
                                           config.robot.control_port,
                                           config.robot.video_port,
-                                        config.robot.sonar_interval):
+                                          config.robot.sonar_interval):
         print("Failed to connect to robot")
         return
 
-    # Store tasks and clients for cleanup
+    # Store tasks for cleanup
     active_tasks = set()
     discord_client = None
     keyboard = None
     
     try:
-        # Set up keyboard control first
-        keyboard = KeyboardController(insect_controller, active_tasks, discord_client, anthropic)
+        # Set up keyboard control
+        keyboard = KeyboardController(insect_controller, active_tasks, discord_client, anthropic_client)
 
-        # Create and add tasks one by one
+        # Create and add tasks
         if config.video_enabled:
             preview_task = asyncio.create_task(keyboard.preview_loop())
             status_task = asyncio.create_task(keyboard.display_recording_status())
@@ -1432,11 +1489,9 @@ async def main():
             exploration_task = asyncio.create_task(insect_controller.manage_exploration())
             active_tasks.add(exploration_task)
 
-
-
-        # First set up Discord if enabled and wait for it to be ready
+        # Set up Discord if enabled
         if config.discord_integration:
-            discord_client = setup_discord(config.discord, insect_controller, config)
+            discord_client = setup_discord(config.discord, insect_controller, keyboard, config)
             if discord_client:
                 discord_task = asyncio.create_task(discord_client.start(config.discord.token))
                 active_tasks.add(discord_task)
@@ -1444,6 +1499,11 @@ async def main():
                 # Wait for Discord to be fully ready
                 await discord_client.ready_event.wait()
 
+                # Register Discord guild and channel with keyboard controller
+                guild = discord.utils.get(discord_client.guilds, id=config.discord.guild_id)
+                if guild:
+                    channel = discord.utils.get(guild.text_channels, id=config.discord.channel_id)
+                    keyboard.register_discord(guild, channel)
 
         # Then set up detection after Discord is ready
         if config.detection_enabled:
@@ -1455,7 +1515,6 @@ async def main():
                 discord_guild = discord.utils.get(discord_client.guilds, id=config.discord.guild_id)
                 if discord_guild:
                     discord_channel = discord.utils.get(discord_guild.text_channels, id=config.discord.channel_id)
-                    keyboard.register_discord(discord_guild, discord_channel)
             
             detection_task = asyncio.create_task(
                 run_realtime_detection([], discord_guild, discord_channel, insect_controller, config)
@@ -1481,6 +1540,8 @@ async def main():
         if keyboard:
             keyboard.quit()
         await shutdown(active_tasks, insect_controller, discord_client)
+
+
 
 if __name__ == "__main__":
     try:
