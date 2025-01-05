@@ -2,8 +2,10 @@
 Modular robot control system with configurable settings and command-line options.
 """
 
+from anthropic import Anthropic
 import argparse
 import asyncio
+import inspect
 import threading
 import time
 import socket
@@ -39,6 +41,7 @@ intents.messages = True
 client_discord = discord.Client(intents=intents)
 guild = None
 channel = None
+anthropic = None
 what_ive_seen = []
 
 class COMMAND:
@@ -107,22 +110,30 @@ class InsectClient:
 
     def print_detection_history(self):
         """Print a summary of all detected objects with their timestamps and locations."""
+        print(self.get_detection_history_string())
+        
+    def get_detection_history_string(self):
+        """Get a formatted string summary of all detected objects with timestamps and locations."""
         if not self.detection_history:
-            print("No objects have been detected yet.")
-            return
-            
-        print("\nMemories:")
-        print("-" * 80)
-        print(f"{'Time':12} | {'Object':15} | {'Response':15} | {'Confidence':10} | {'Position':15} | {'Orientation':10}")
-        print("-" * 80)
+            return "No objects have been detected yet."
+        
+        output = []
+        output.append("\nMemories:")
+        output.append("-" * 80)
+        output.append(f"{'Time':12} | {'Object':15} | {'Response':15} | {'Confidence':10} | {'Position':15} | {'Orientation':10}")
+        output.append("-" * 80)
         
         for record in self.detection_history:
-            print(f"{record.timestamp.strftime('%H:%M:%S'):12} | "
+            output.append(
+                f"{record.timestamp.strftime('%H:%M:%S'):12} | "
                 f"{record.object_class:15} | "
                 f"{record.response_to_object:15} | "
                 f"{record.confidence:10.2f} | "
                 f"({record.position[0]:3.1f}, {record.position[1]:3.1f}) | "
-                f"{record.orientation:10.1f}°")
+                f"{record.orientation:10.1f}°"
+            )
+        
+        return "\n".join(output)
         
     def connect(self, ip, port=5002, video_port=8002, sonar_interval = 1.0):
         self.last_connection_params = (ip, port, video_port)
@@ -241,18 +252,21 @@ class InsectClient:
         """Stop recording and ensure proper cleanup."""
         duration = None
         try:
-            if self.video_writer is not None and self.recording_start_time is not None:
+            if self.recording and self.recording_start_time is not None:
                 duration = time.time() - self.recording_start_time
-                print("Releasing video writer...")
-                self.video_writer.release()
-                print(f"Video saved to: {self.current_recording_file}")
+                if self.video_writer is not None:
+                    print("Releasing video writer...")
+                    self.video_writer.release()
+                    print(f"Video saved to: {self.current_recording_file}")
         except Exception as e:
             print(f"Error stopping recording: {e}")
         finally:
             self.video_writer = None
             self.recording = False
             self.recording_start_time = None
+            self.current_recording_file = None
         return duration
+
 
     def start_recording(self):
         """Start recording video with proper frame validation."""
@@ -679,24 +693,22 @@ async def post(guild, channel, message):
     else:
         print('Guild not found when posting!')
 
-async def ollama_list(prompt):
-    response: ChatResponse = chat(model='llama3.2:3b', messages=[
-    {
-        'role': 'user',
-        'content': f'give me just a comma-delimited list of simple physical features often found on a {prompt}.',
-    },
-    ])
-    return response.message.content
+
 
 async def ollama_approach_flee_ignore(obj):
+    return await ollama_message(f'I am an insect. Given this object – {obj} – output a single word response: "approach", "flee" or "ignore".') 
+
+async def ollama_message(message):
     response: ChatResponse = chat(model='llama3.2:3b', messages=[
     {
         'role': 'user',
-        'content': f'I am an insect. Given this object – {obj} – output a single word response: "approach", "flee" or "ignore".',
+        'content': message,
     },
     ])
     return response.message.content.strip().lower()
 
+    
+    
 async def run_realtime_detection(classes, guild, channel, insect_controller, config):
     print("Starting realtime detection...")
    
@@ -949,10 +961,11 @@ class ConfigManager:
 
 class KeyboardController:
 
-    def __init__(self, insect_control: 'InsectControl', active_tasks=None, discord_client=None):
+    def __init__(self, insect_control: 'InsectControl', active_tasks=None, discord_client=None, anthropic_client=None):
         self.control = insect_control
         self.active_tasks = active_tasks or []
         self.discord_client = discord_client
+        self.anthropic_client = anthropic_client
         self.commands = {
             'w': ('Move forward', self.control.handle_movement),
             's': ('Move backward', self.control.handle_movement),
@@ -968,21 +981,72 @@ class KeyboardController:
             'r': ('Toggle servo power', self.control.toggle_servo_power),
             'b': ('Toggle balance mode', self.control.toggle_balance),
             'x': ('Toggle exploration mode', self.toggle_exploration),
-            'n': ('Toggle sonar', self.control.get_sonar),
+            'r': ('Toggle sonar', self.control.get_sonar),
             'z': ('Buzz', self.control.toggle_buzz),
             'v': ('Toggle video recording mode', self.toggle_video_recording),
             'y': ('Preview', self.toggle_yolo),
             'o': ('Print detections', self.control.print_detections),
-            '?y': ('Print help', self.print_help),
+            '?': ('Print help', self.print_help),
             'c': ('Get power status', self.control.get_power_status),
             'p': ('Preview', self.control.show_preview),
             'l': ('Print detection history', lambda: self.control.client.print_detection_history()),
+            'm': ('Muse', self.muse),
             '+': ('Increase speed', self.increase_speed),
             '-': ('Decrease speed', self.decrease_speed),
             '!': ('Quit', self.quit),
             'esc': ('Quit', self.quit)
         }
         self.running = True
+        self.guild = None
+        self.channel = None        
+
+
+
+    def create_prompt(self, client):
+        """Create the full prompt for Claude."""
+        records = client.get_detection_history_string()
+        return f"""Reflect on the following record of your memories:\n\n{records}"""
+
+
+
+    def get_claude_response(self, prompt):
+        """Send prompt to Claude and get response."""
+        try:
+            if not self.anthropic_client:
+                print("Error: Anthropic client not initialized")
+                return None
+            message = self.anthropic_client.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=1000,
+                temperature=1.0,
+                system="You are an AI chatbot who imitates the narrator of Kafka's Metamorphosis very precisely.",
+                messages=[{
+                    "role": "user",
+                    "content": prompt
+                }]
+            )
+            return message.content.text
+        except Exception as e:
+            print(f"Error getting Claude response: {e}")
+            return None
+        
+
+    async def muse(self):
+        """Send Claude's response to discord."""
+        try:
+            memories = self.create_prompt(self.control.client)
+            # response = self.get_claude_response(memories)
+            response = await ollama_message(memories)
+            
+            if response and self.guild and self.channel:
+                await post(self.guild, self.channel, memories[0:2000])
+                await post(self.guild, self.channel, response[0:2000])
+        except Exception as e:
+            print(f"Error in muse function: {e}")
+            
+    def register_discord(self, guild, channel):
+        self.guild = guild
+        self.channel = channel
 
     def quit(self):
         """Initiate graceful shutdown of all components."""
@@ -1095,12 +1159,18 @@ class KeyboardController:
             cmd = await asyncio.get_event_loop().run_in_executor(None, input, "Enter command: ")
             if cmd in self.commands:
                 _, func = self.commands[cmd]
-                if cmd in ['w', 'a', 's', 'd']:
-                    func(cmd)
+                if inspect.iscoroutinefunction(func):
+                    # If it's an async function, await it
+                    await func()
                 else:
-                    func()
+                    # For regular functions, call normally
+                    if cmd in ['w', 'a', 's', 'd']:
+                        func(cmd)
+                    else:
+                        func()
             elif cmd == 'h':
                 self.print_help()
+
 
     def format_duration(self, seconds):
         """Format duration in seconds to HH:MM:SS format."""
@@ -1265,8 +1335,14 @@ async def shutdown(tasks, insect_controller, discord_client):
             insect_controller.stop_movement()
             
             # Stop recording if active
-            if insect_controller.client.recording:
-                insect_controller.client.stop_recording()
+            if hasattr(insect_controller.client, 'recording') and insect_controller.client.recording:
+                try:
+                    if insect_controller.client.recording_start_time is not None:
+                        duration = time.time() - insect_controller.client.recording_start_time
+                        print(f"Stopping recording - Duration: {duration:.1f}s")
+                    insect_controller.client.stop_recording()
+                except Exception as e:
+                    print(f"Error stopping recording during shutdown: {e}")
             
             # Force video thread to stop
             insect_controller.client.tcp_flag = False
@@ -1274,41 +1350,47 @@ async def shutdown(tasks, insect_controller, discord_client):
             # Disconnect from robot
             insect_controller.client.disconnect()
         except Exception as e:
-            print(f"Error during robot cleanup: {e}")
+            print(f"Error during robot cleanup: {str(e)}")
+            # Continue with shutdown despite error
     
     # Close Discord client
     if discord_client:
         try:
             await discord_client.close()
         except Exception as e:
-            print(f"Error closing Discord client: {e}")
+            print(f"Error closing Discord client: {str(e)}")
     
-    # Cancel all tasks immediately
+    # Cancel all tasks
     for task in tasks:
         try:
             if not task.done():
                 task.cancel()
         except Exception as e:
-            print(f"Error cancelling task: {e}")
+            print(f"Error cancelling task: {str(e)}")
     
     # Wait briefly for tasks to complete
     if tasks:
         try:
             await asyncio.wait(tasks, timeout=0.5)
         except Exception as e:
-            print(f"Error during task cleanup: {e}")
-    
-    # Stop the event loop
-    try:
-        loop = asyncio.get_running_loop()
-        loop.stop()
-    except Exception as e:
-        print(f"Error stopping event loop: {e}")
+            print(f"Error during task cleanup: {str(e)}")
+
+    print("Shutdown complete.")
+
 
 async def main():
     args = parse_args()
     config = ConfigManager(args.config)
     
+    # Get API key from environment variable
+    api_key = os.getenv('ANTHROPIC_API_KEY')
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY not found in environment variables")
+
+    anthropic = Anthropic(api_key=api_key)
+
+
+
     # Use config values by default, fall back to CLI args if not set
     config.explore = getattr(config, 'explore', False) or args.explore
     config.discord_integration = getattr(config, 'discord_integration', False) or args.discord
@@ -1335,7 +1417,7 @@ async def main():
     
     try:
         # Set up keyboard control first
-        keyboard = KeyboardController(insect_controller, active_tasks, discord_client)
+        keyboard = KeyboardController(insect_controller, active_tasks, discord_client, anthropic)
 
         # Create and add tasks one by one
         if config.video_enabled:
@@ -1373,6 +1455,7 @@ async def main():
                 discord_guild = discord.utils.get(discord_client.guilds, id=config.discord.guild_id)
                 if discord_guild:
                     discord_channel = discord.utils.get(discord_guild.text_channels, id=config.discord.channel_id)
+                    keyboard.register_discord(discord_guild, discord_channel)
             
             detection_task = asyncio.create_task(
                 run_realtime_detection([], discord_guild, discord_channel, insect_controller, config)
