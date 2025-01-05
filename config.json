@@ -45,7 +45,7 @@
       "spin_probability": 0.3,
       "max_spin_angle": 90
   },
-  "explore": false,
+  "explore": true,
   "discord_integration": true,
   "video_enabled": true,
   "detection_enabled": true,

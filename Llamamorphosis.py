@@ -67,6 +67,7 @@ class DetectionRecord:
     position: tuple  # (x, y) robot position
     orientation: float  # robot orientation in degrees
     frame_location: tuple  # (x, y) location in frame
+    response_to_object: str
 
 # InsectClient class
 class InsectClient:
@@ -110,14 +111,15 @@ class InsectClient:
             print("No objects have been detected yet.")
             return
             
-        print("\nDetection History:")
+        print("\nMemories:")
         print("-" * 80)
-        print(f"{'Time':12} | {'Object':15} | {'Confidence':10} | {'Position':15} | {'Orientation':10}")
+        print(f"{'Time':12} | {'Object':15} | {'Response':15} | {'Confidence':10} | {'Position':15} | {'Orientation':10}")
         print("-" * 80)
         
         for record in self.detection_history:
             print(f"{record.timestamp.strftime('%H:%M:%S'):12} | "
                 f"{record.object_class:15} | "
+                f"{record.response_to_object:15} | "
                 f"{record.confidence:10.2f} | "
                 f"({record.position[0]:3.1f}, {record.position[1]:3.1f}) | "
                 f"{record.orientation:10.1f}°")
@@ -333,45 +335,37 @@ class InsectClient:
 
     def send_command(self, command):
         """Send command to robot and receive response."""
-
-        print(f"Sending command: {command.strip()}")  # Log the command being sent
-        
         if not self.tcp_flag or not self.client_socket:
             print("Not connected to robot")
             return None
             
         try:
-            # Store original blocking state
-            original_blocking = self.client_socket.getblocking()
+            # Keep socket in blocking mode for sending
+            self.client_socket.setblocking(True)
+            self.client_socket.send(command.encode('utf-8'))
             
-            try:
-                # Send the command
-                self.client_socket.send(command.encode('utf-8'))
-                
-                # Set socket to non-blocking temporarily
-                self.client_socket.setblocking(0)
-                
-                # Wait for response with timeout
-                ready = select.select([self.client_socket], [], [], 0.5)  # 0.5 second timeout
-                
-                if ready[0]:
-                    # Socket has data
+            # Switch to non-blocking for receive with timeout
+            self.client_socket.setblocking(False)
+            
+            # Use select with timeout
+            ready = select.select([self.client_socket], [], [], 0.5)  # 0.5 second timeout
+            
+            if ready[0]:
+                try:
                     response = self.client_socket.recv(1024).decode('utf-8')
                     return response.strip()
-                else:
-                    # print("No response received (timeout)")
-                    return None
-                    
-            finally:
-                # Always restore original blocking state
-                if original_blocking != self.client_socket.getblocking():
-                    self.client_socket.setblocking(original_blocking)
-                    
+                except socket.error as e:
+                    if e.errno == 35 or e.errno == 11:  # EAGAIN/EWOULDBLOCK
+                        # No data available right now, that's okay
+                        return None
+                    raise
+            else:
+                return None
+                
         except socket.error as e:
             if e.errno == 9:  # Bad file descriptor
                 print("Socket is in invalid state, attempting to reconnect...")
                 self.tcp_flag = False
-                # Attempt to reconnect using last known good IP and ports
                 if hasattr(self, 'last_connection_params'):
                     self.connect(*self.last_connection_params)
             else:
@@ -380,8 +374,14 @@ class InsectClient:
         except Exception as e:
             print(f"Failed to send command: {e}")
             return None
+        finally:
+            # Always return socket to blocking mode
+            try:
+                self.client_socket.setblocking(True)
+            except:
+                pass
 
-
+            
     def disconnect(self):
         self.tcp_flag = False
         if self.recording:
@@ -761,6 +761,10 @@ async def run_realtime_detection(classes, guild, channel, insect_controller, con
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     frame_location = ((x1 + x2) // 2, (y1 + y2) // 2)
                     
+
+                    response_to_object = await ollama_approach_flee_ignore(class_name)
+
+
                     # Create detection record
                     detection = DetectionRecord(
                         object_class=class_name,
@@ -768,7 +772,8 @@ async def run_realtime_detection(classes, guild, channel, insect_controller, con
                         confidence=confidence,
                         position=insect_controller.client.position,
                         orientation=insect_controller.client.orientation,
-                        frame_location=frame_location
+                        frame_location=frame_location,
+                        response_to_object=response_to_object
                     )
 
                     # Add to history if it's a new object
@@ -781,7 +786,6 @@ async def run_realtime_detection(classes, guild, channel, insect_controller, con
                             await post(guild, channel, 
                                 f'I just saw {class_name} at position {detection.position}, ' 
                                 f'orientation {detection.orientation:.1f}° at {detection.timestamp.strftime("%H:%M:%S")}')
-                            response_to_object = await ollama_approach_flee_ignore(class_name)
                             await post(guild, channel, f'I am going to {response_to_object}')
 
                             # Integrate with Insect Robot:
