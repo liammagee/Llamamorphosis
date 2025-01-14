@@ -44,6 +44,9 @@ channel = None
 anthropic = None
 what_ive_seen = []
 
+anthropic_client=None
+
+
 class COMMAND:
     CMD_MOVE = "CMD_MOVE"
     CMD_LED_MOD = "CMD_LED_MOD"
@@ -696,17 +699,39 @@ async def post(guild, channel, message):
         print('Guild not found when posting!')
 
 
-async def ollama_approach_flee_ignore(obj):
-    return await ollama_message(f'I am an insect. Given this object – {obj} – output a single word response: "approach", "flee" or "ignore".') 
 
-async def ollama_message(message):
-    response: ChatResponse = chat(model='llama3.2:3b', messages=[
-    {
-        'role': 'user',
-        'content': message,
-    },
-    ])
-    return response.message.content.strip().lower()
+
+async def llm_approach_flee_ignore(obj):
+    return await llm_message(f'I am an insect. Given this object – {obj} – output a single word response: "approach", "flee" or "ignore".') 
+
+
+async def llm_message(message):
+    """Send prompt to LLM and get response."""
+    try:
+        # If Anthropic is not initialised, try local Ollama
+        if not anthropic_client:
+            response: ChatResponse = chat(model='llama3.2:3b', messages=[
+            {
+                'role': 'user',
+                'content': message,
+            },
+            ])
+            return response.message.content.strip().lower()
+        else:
+            message = anthropic_client.messages.create(
+                model="claude-3-5-sonnet-20241022",
+                max_tokens=1000,
+                temperature=1.0,
+                system="You are an AI chatbot who imitates the narrator of Kafka's Metamorphosis very precisely.",
+                messages=[{
+                    "role": "user",
+                    "content": message
+                }]
+            )
+            return message.content.text
+    except Exception as e:
+        print(f"Error getting LLM response: {e}")
+        return None
 
     
     
@@ -775,7 +800,7 @@ async def run_realtime_detection(classes, guild, channel, insect_controller, con
                     frame_location = ((x1 + x2) // 2, (y1 + y2) // 2)
                     
 
-                    response_to_object = await ollama_approach_flee_ignore(class_name)
+                    response_to_object = await llm_approach_flee_ignore(class_name)
 
 
                     # Create detection record
@@ -904,6 +929,7 @@ class ConfigManager:
         self.video_enabled = True
         self.detection_enabled = False
         self.post_images = True
+        self.llm_server = 'Ollama'
 
         if self.config_path.exists():
             self.load_config()
@@ -928,6 +954,7 @@ class ConfigManager:
         print(f"  Video Enabled: {self.video_enabled}")
         print(f"  Detection Enabled: {self.detection_enabled}")
         print(f"  Post Images: {self.post_images}")
+        print(f"  LLM Server: {self.llm_server}")
 
 
     def load_config(self):
@@ -962,11 +989,10 @@ class ConfigManager:
 
 class KeyboardController:
 
-    def __init__(self, insect_control: 'InsectControl', active_tasks=None, discord_client=None, anthropic_client=None):
+    def __init__(self, insect_control: 'InsectControl', active_tasks=None, discord_client=None):
         self.control = insect_control
         self.active_tasks = active_tasks or []
         self.discord_client = discord_client
-        self.anthropic_client = anthropic_client
         self.commands = {
             'w': ('Move forward', self.control.handle_movement),
             's': ('Move backward', self.control.handle_movement),
@@ -1005,44 +1031,22 @@ class KeyboardController:
 
 
     def create_prompt_for_reflection(self, client):
-        """Create the full prompt for Claude."""
+        """Create the full prompt."""
         records = client.get_detection_history_string()
         return f"""Reflect on the following record of your memories:\n\n{records}"""
 
     def create_prompt_for_a_plan(self, client):
-        """Create the full prompt for Claude."""
+        """Create the full prompt."""
         records = client.get_detection_history_string()
         return f"""Given the following record of your memories:\n\n{records}, generate a plan of action. This should include a sequence of horizontal movements that responds meaningfully to your memories of your world."""
 
 
-    def get_claude_response(self, prompt):
-        """Send prompt to Claude and get response."""
-        try:
-            if not self.anthropic_client:
-                print("Error: Anthropic client not initialized")
-                return None
-            message = self.anthropic_client.messages.create(
-                model="claude-3-5-sonnet-20241022",
-                max_tokens=1000,
-                temperature=1.0,
-                system="You are an AI chatbot who imitates the narrator of Kafka's Metamorphosis very precisely.",
-                messages=[{
-                    "role": "user",
-                    "content": prompt
-                }]
-            )
-            return message.content.text
-        except Exception as e:
-            print(f"Error getting Claude response: {e}")
-            return None
-        
 
     async def jump_around(self):
-        """Send Claude's response to discord."""
+        """Send LLM's response to discord."""
         try:
             memories = self.create_prompt_for_a_plan(self.control.client)
-            # response = self.get_claude_response(memories)
-            response = await ollama_message(memories)
+            response = await llm_message(memories)
             
             if response and self.guild and self.channel:
                 await post(self.guild, self.channel, memories[0:2000])
@@ -1051,11 +1055,10 @@ class KeyboardController:
             print(f"Error in muse function: {e}")
 
     async def muse(self):
-        """Send Claude's response to discord."""
+        """Send LLM's response to discord."""
         try:
             memories = self.create_prompt_for_reflection(self.control.client)
-            # response = self.get_claude_response(memories)
-            response = await ollama_message(memories)
+            response = await llm_message(memories)
             
             if response and self.guild and self.channel:
                 await post(self.guild, self.channel, memories[0:2000])
@@ -1065,12 +1068,12 @@ class KeyboardController:
                         
 
     async def print_history(self):
-        """Send Claude's response to discord."""
+        """Send LLM's response to discord."""
         history = self.control.client.get_detection_history_string()
         print(history)
         await post(self.guild, self.channel, history[0:2000])
 
-        
+
             
     def register_discord(self, guild, channel):
         self.guild = guild
@@ -1446,15 +1449,17 @@ async def shutdown(tasks, insect_controller, discord_client):
     print("Shutdown complete.")
 
 async def main():
+    global anthropic_client
+
     args = parse_args()
     config = ConfigManager(args.config)
     
     # Get API key from environment variable
-    api_key = os.getenv('ANTHROPIC_API_KEY')
-    if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY not found in environment variables")
-
-    anthropic_client = Anthropic(api_key=api_key)
+    if config.llm_server == 'anthropic':
+        api_key = os.getenv('ANTHROPIC_API_KEY')
+        if not api_key:
+            raise ValueError("No Anthropic key set in the environment.")
+        anthropic_client = Anthropic(api_key=api_key)
 
     # Initialize robot controller
     insect_controller = InsectControl()
@@ -1474,7 +1479,7 @@ async def main():
     
     try:
         # Set up keyboard control
-        keyboard = KeyboardController(insect_controller, active_tasks, discord_client, anthropic_client)
+        keyboard = KeyboardController(insect_controller, active_tasks, discord_client)
 
         # Create and add tasks
         if config.video_enabled:

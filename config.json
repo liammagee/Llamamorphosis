@@ -49,5 +49,6 @@
   "discord_integration": true,
   "video_enabled": true,
   "detection_enabled": true,
-  "post_images": false
+  "post_images": false,
+  "llm_server": "ollama"
 }
