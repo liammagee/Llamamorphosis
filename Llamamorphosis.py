@@ -199,7 +199,8 @@ class InsectClient:
                         leng = struct.unpack('<L', stream_bytes)[0]
                         if leng <= 0 or leng > 1000000:  # Sanity check on length
                             print(f"Invalid frame length: {leng}")
-                            continue
+                            break
+
                     except struct.error as e:
                         print(f"Error unpacking stream length: {e}")
                         continue
@@ -703,15 +704,46 @@ async def post(guild, channel, message):
 
 
 
+async def llm_dynamic(obj, frame_location, llm_server):
+    return await llm_message(
+f'''
+I am an insect. I can issue the following commands.
+
+Spin (<spin angle> should be between 45 and -45 degrees):
+
+    CMD_MOVE#2#0#0#8#<spin angle>
+
+
+Move forward:
+
+    CMD_MOVE#1#0#10#8#0
+
+    
+Stop movement:
+    
+    CMD_MOVE#1#0#0#8#0
+
+    
+Given this object – {obj} – at this location – {frame_location} – generate a sequence of commands. For example, I might approach, flee or ignore the object. 
+
+DO NOT OUTPUT ANYTHING OTHER THAN THE COMMANDS.
+
+
+''', llm_server) 
+
+
+
 async def llm_approach_flee_ignore(obj, llm_server):
     return await llm_message(f'I am an insect. Given this object – {obj} – output a single word response: "approach", "flee" or "ignore".', llm_server) 
+    
+
 
 
 async def llm_message(message, llm_server):
     """Send prompt to LLM and get response."""
     try:
         # If Anthropic is not initialised, try local Ollama
-        if llm_server.name is not 'anthropic':
+        if llm_server.name != 'anthropic':
             response: ChatResponse = chat(model=llm_server.model, messages=[
             {
                 'role': 'user',
@@ -801,8 +833,10 @@ async def run_realtime_detection(classes, guild, channel, insect_controller, con
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     frame_location = ((x1 + x2) // 2, (y1 + y2) // 2)
                     
-
-                    response_to_object = await llm_approach_flee_ignore(class_name, config.llm_server)
+                    if config.llm_server.dynamic:
+                        response_to_object = await llm_dynamic(class_name, frame_location, config.llm_server)
+                    else:
+                        response_to_object = await llm_approach_flee_ignore(class_name, config.llm_server)
 
 
                     # Create detection record
@@ -826,17 +860,24 @@ async def run_realtime_detection(classes, guild, channel, insect_controller, con
                             await post(guild, channel, 
                                 f'I just saw {class_name} at position {detection.position}, ' 
                                 f'orientation {detection.orientation:.1f}° at {detection.timestamp.strftime("%H:%M:%S")}')
-                            await post(guild, channel, f'I am going to {response_to_object}')
+                            await post(guild, channel, f'I am going to respond as follows:\n{response_to_object}')
 
-                            # Integrate with Insect Robot:
-                            if response_to_object == "approach":
-                                insect_controller.handle_movement('w')  # Move forward
-                                await asyncio.sleep(1)  # Move for a second
-                                insect_controller.stop_movement()
-                            elif response_to_object == "flee":
-                                insect_controller.handle_movement('s')  # Move backward
-                                await asyncio.sleep(1)
-                                insect_controller.stop_movement()
+                            if config.llm_server.dynamic:
+                                lines = response_to_object.split('\n')
+                                for line in lines:
+                                    insect_controller.client.send_command(line + '\n')
+                                    await asyncio.sleep(1)  # Move for a second
+                            else:
+
+                                # Integrate with Insect Robot:
+                                if response_to_object == "approach":
+                                    insect_controller.handle_movement('w')  # Move forward
+                                    await asyncio.sleep(1)  # Move for a second
+                                    insect_controller.stop_movement()
+                                elif response_to_object == "flee":
+                                    insect_controller.handle_movement('s')  # Move backward
+                                    await asyncio.sleep(1)
+                                    insect_controller.stop_movement()
                         
                         # Resume exploration after handling the object
                         await asyncio.sleep(2)
@@ -906,6 +947,7 @@ class LLMSettings:
     """Configuration settings for LLM."""
     name: str = 'ollama'
     model: str = 'llama3.2:3b'
+    dynamic: bool = True
 
 @dataclass
 class DiscordSettings:
