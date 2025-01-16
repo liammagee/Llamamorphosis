@@ -599,7 +599,8 @@ class InsectControl:
     def stop_movement(self):
         if hasattr(self, 'movement_start_time') and hasattr(self, 'current_movement_direction'):
             # Calculate actual movement duration
-            movement_duration = time.time() - self.movement_start_time
+            if self.movement_start_time is not None:
+                movement_duration = time.time() - self.movement_start_time
             # Update position with actual duration
             self.client.update_position((self.current_movement_direction, None), movement_duration)
             # Clear movement tracking
@@ -616,6 +617,7 @@ class InsectControl:
         command = f"{self.cmd.CMD_SERVOPOWER}#{1 if self.client.servo_power else 0}\n"
         self.client.send_command(command)
         print(f"Servos {'powered' if self.client.servo_power else 'relaxed'}")
+
 
     def get_sonar(self):
         command = f"{self.cmd.CMD_SONIC}\n"
@@ -701,8 +703,8 @@ async def post(guild, channel, message):
 
 
 
-async def llm_approach_flee_ignore(obj):
-    return await llm_message(f'I am an insect. Given this object – {obj} – output a single word response: "approach", "flee" or "ignore".') 
+async def llm_approach_flee_ignore(obj, llm_server):
+    return await llm_message(f'I am an insect. Given this object – {obj} – output a single word response: "approach", "flee" or "ignore".', llm_server) 
 
 
 async def llm_message(message, llm_server):
@@ -800,7 +802,7 @@ async def run_realtime_detection(classes, guild, channel, insect_controller, con
                     frame_location = ((x1 + x2) // 2, (y1 + y2) // 2)
                     
 
-                    response_to_object = await llm_approach_flee_ignore(class_name)
+                    response_to_object = await llm_approach_flee_ignore(class_name, config.llm_server)
 
 
                     # Create detection record
@@ -1016,20 +1018,20 @@ class KeyboardController:
             'g': ('Head down', lambda: self.control.move_head('down')),
             'f': ('Head left', lambda: self.control.move_head('left')),
             'h': ('Head right', lambda: self.control.move_head('right')),
-            ' ': ('Stop movement', self.control.stop_movement),
-            'r': ('Toggle servo power', self.control.toggle_servo_power),
+            'm': ('Stop movement', self.control.stop_movement),
+            'p': ('Toggle relaxation', self.control.toggle_servo_power),
             'b': ('Toggle balance mode', self.control.toggle_balance),
             'x': ('Toggle exploration mode', self.toggle_exploration),
-            'r': ('Toggle sonar', self.control.get_sonar),
+            'o': ('Toggle sonar', self.control.get_sonar),
             'z': ('Buzz', self.control.toggle_buzz),
             'v': ('Toggle video recording mode', self.toggle_video_recording),
             'y': ('Preview', self.toggle_yolo),
-            'o': ('Print detections', self.control.print_detections),
+            'c': ('Print detections', self.control.print_detections),
             '?': ('Print help', self.print_help),
-            'c': ('Get power status', self.control.get_power_status),
+            'k': ('Get power status', self.control.get_power_status),
             'p': ('Preview', self.control.show_preview),
-            'l': ('Print detection history', self.print_history),
-            'm': ('Muse', self.muse),
+            'i': ('Print detection history', self.print_history),
+            'u': ('Muse', self.muse),
             'j': ('Jump around', self.jump_around),
             '+': ('Increase speed', self.increase_speed),
             '-': ('Decrease speed', self.decrease_speed),
