@@ -705,12 +705,12 @@ async def llm_approach_flee_ignore(obj):
     return await llm_message(f'I am an insect. Given this object – {obj} – output a single word response: "approach", "flee" or "ignore".') 
 
 
-async def llm_message(message):
+async def llm_message(message, llm_server):
     """Send prompt to LLM and get response."""
     try:
         # If Anthropic is not initialised, try local Ollama
-        if not anthropic_client:
-            response: ChatResponse = chat(model='llama3.2:3b', messages=[
+        if llm_server.name is not 'anthropic':
+            response: ChatResponse = chat(model=llm_server.model, messages=[
             {
                 'role': 'user',
                 'content': message,
@@ -900,6 +900,12 @@ class YOLOSettings:
     iou_threshold: float = 0.45
 
 @dataclass
+class LLMSettings:
+    """Configuration settings for LLM."""
+    name: str = 'ollama'
+    model: str = 'llama3.2:3b'
+
+@dataclass
 class DiscordSettings:
     """Configuration settings for Discord integration."""
     token: Optional[str] = None
@@ -923,13 +929,14 @@ class ConfigManager:
         self.config_path = Path(config_path)
         self.robot = RobotSettings()
         self.yolo = YOLOSettings()
+        self.llm_server = LLMSettings()
         self.discord = DiscordSettings.from_env()
         self.explore = False
         self.discord_integration = False
         self.video_enabled = True
         self.detection_enabled = False
         self.post_images = True
-        self.llm_server = 'Ollama'
+        
 
         if self.config_path.exists():
             self.load_config()
@@ -944,6 +951,10 @@ class ConfigManager:
         for key, value in self.yolo.__dict__.items():
             print(f"  {key}: {value}")
         
+        print("\nLLM Settings:")
+        for key, value in self.llm_server.__dict__.items():
+            print(f"  {key}: {value}")
+        
         print("\nDiscord Settings:")
         for key, value in self.discord.__dict__.items():
             print(f"  {key}: {value}")
@@ -954,7 +965,6 @@ class ConfigManager:
         print(f"  Video Enabled: {self.video_enabled}")
         print(f"  Detection Enabled: {self.detection_enabled}")
         print(f"  Post Images: {self.post_images}")
-        print(f"  LLM Server: {self.llm_server}")
 
 
     def load_config(self):
@@ -964,6 +974,7 @@ class ConfigManager:
                 config = json.load(f)
                 self.robot = RobotSettings(**config.get('robot', {}))
                 self.yolo = YOLOSettings(**config.get('yolo', {}))
+                self.llm_server = LLMSettings(**config.get('llm_server', {}))
                 self.explore = config.get('explore', self.explore)
                 self.discord_integration = config.get('discord_integration', self.discord_integration)
                 self.video_enabled = config.get('video_enabled', self.video_enabled)
@@ -989,10 +1000,11 @@ class ConfigManager:
 
 class KeyboardController:
 
-    def __init__(self, insect_control: 'InsectControl', active_tasks=None, discord_client=None):
+    def __init__(self, insect_control: 'InsectControl', active_tasks=None, discord_client=None, llm_server=None):
         self.control = insect_control
         self.active_tasks = active_tasks or []
         self.discord_client = discord_client
+        self.llm_server = llm_server
         self.commands = {
             'w': ('Move forward', self.control.handle_movement),
             's': ('Move backward', self.control.handle_movement),
@@ -1027,6 +1039,7 @@ class KeyboardController:
         self.running = True
         self.guild = None
         self.channel = None        
+        
 
 
 
@@ -1040,13 +1053,11 @@ class KeyboardController:
         records = client.get_detection_history_string()
         return f"""Given the following record of your memories:\n\n{records}, generate a plan of action. This should include a sequence of horizontal movements that responds meaningfully to your memories of your world."""
 
-
-
     async def jump_around(self):
         """Send LLM's response to discord."""
         try:
             memories = self.create_prompt_for_a_plan(self.control.client)
-            response = await llm_message(memories)
+            response = await llm_message(memories, self.llm_server)
             
             if response and self.guild and self.channel:
                 await post(self.guild, self.channel, memories[0:2000])
@@ -1058,7 +1069,7 @@ class KeyboardController:
         """Send LLM's response to discord."""
         try:
             memories = self.create_prompt_for_reflection(self.control.client)
-            response = await llm_message(memories)
+            response = await llm_message(memories, self.llm_server)
             
             if response and self.guild and self.channel:
                 await post(self.guild, self.channel, memories[0:2000])
@@ -1070,10 +1081,7 @@ class KeyboardController:
     async def print_history(self):
         """Send LLM's response to discord."""
         history = self.control.client.get_detection_history_string()
-        print(history)
         await post(self.guild, self.channel, history[0:2000])
-
-
             
     def register_discord(self, guild, channel):
         self.guild = guild
@@ -1455,7 +1463,7 @@ async def main():
     config = ConfigManager(args.config)
     
     # Get API key from environment variable
-    if config.llm_server == 'anthropic':
+    if config.llm_server.name == 'anthropic':
         api_key = os.getenv('ANTHROPIC_API_KEY')
         if not api_key:
             raise ValueError("No Anthropic key set in the environment.")
@@ -1479,7 +1487,7 @@ async def main():
     
     try:
         # Set up keyboard control
-        keyboard = KeyboardController(insect_controller, active_tasks, discord_client)
+        keyboard = KeyboardController(insect_controller, active_tasks, discord_client, config.llm_server)
 
         # Create and add tasks
         if config.video_enabled:

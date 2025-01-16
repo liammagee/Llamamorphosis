@@ -50,5 +50,8 @@
   "video_enabled": true,
   "detection_enabled": true,
   "post_images": false,
-  "llm_server": "ollama"
+  "llm_server": {
+    "name": "ollama",
+    "model": "llama3.2:3b"
+  }
 }
