@@ -30,8 +30,9 @@ from discord import File
 
 load_dotenv()
 
-# Environment variables
+# Environment variables 
 TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+
 GUILD_ID = int(os.getenv('DISCORD_GUILD_ID', 0))
 CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', 0))
 
@@ -43,6 +44,7 @@ guild = None
 channel = None
 anthropic = None
 what_ive_seen = []
+objects_in_world = []
 
 anthropic_client=None
 
@@ -97,7 +99,7 @@ class InsectClient:
         self.exploring = False
         self.last_exploration_time = time.time()
         self.exploration_interval = 5  
-        self.exploration_duration = 2  
+        self.exploration_duration = 0.5
         self.recording_start_time = None
         self.current_recording_file = None        
         self.buzzing = None        
@@ -110,6 +112,7 @@ class InsectClient:
         self.max_spin_ang = 90
         self.detection_history = []  # List of DetectionRecord objects      
         self.sonar_interval = 1.0  
+        self.stack_messages = []
 
     def print_detection_history(self):
         """Print a summary of all detected objects with their timestamps and locations."""
@@ -475,7 +478,109 @@ class InsectClient:
         elif move == 'd': x += 1
         return (x, y)
 
-    async def random_explore(self):
+    async def llm_explore(self, channel, config):
+        """Performs exploration by spinning randomly and moving forward."""
+        if not self.tcp_flag or not self.servo_power:
+            return
+
+        try:
+
+            # Check if the robot is stuck
+            frame_location = (int(self.position[0]), int(self.position[1]))
+
+            my_history = ''
+            for pos in self.visited_cells:
+                my_history += f"({pos[0]}, {pos[1]})" + '\n'
+            instruction = f'''
+You are an insect. You can issue the following commands:
+
+To rotate (<spin angle> should be between 45 and -45 degrees):
+
+    CMD_MOVE#2#0#0#8#<spin angle>
+
+
+To move forward:
+
+    CMD_MOVE#1#0#10#8#0
+
+    
+Stop movement:
+    
+    CMD_MOVE#1#0#0#8#0
+    
+NOTE THAT ALL VALID COMMANDS COMMENCE WITH 'CMD_MOVE'. DO NOT USE 'CMD_ROTATE'. ALWAYS TERMINATE WITH STOP: 'CMD_MOVE#1#0#0#8#0'.
+
+This is the history of your movement: {my_history}
+
+To travel to where you want to go next, you need to issue a sequence of commands using the syntax above: rotate, move forward, stop. Each command should be separated by a line break.
+
+Where should you go next? You really want to visit new locations, even if it means choosing directions that are not at 90 degree angles.
+
+ONLY OUTPUT THE COMMANDS THEMSELVES. PRINT EACH COMMAND ON A NEW LINE. THE COMMAND SHOULD BEGIN AT THE START OF THE LINE. DO NOT ADD OTHER CHARACTERS. 
+
+'''
+
+            reasoning, response = await llm_message(self, instruction, config.llm_server)         
+
+            for command in response.split('\n'):
+                command = command.lstrip('`*').upper()
+                if command.upper().startswith('CMD_MOVE'):
+                    if command.startswith('CMD_MOVE#1'):
+                        if self.is_path_clear():
+                            self.send_command(command)
+                            self.update_position(('w', None), self.exploration_duration)
+                            await asyncio.sleep(self.exploration_duration)
+                            self.send_command("CMD_MOVE#1#0#0#8#0\n")
+                    elif command.startswith('CMD_MOVE#2'):
+                        spin_angle = float(command.split('#')[5])  # Extract spin angle from last parameter
+                        if spin_angle is not None:
+                            spin_duration = abs(spin_angle) / 45  # Adjust this value based on actual robot speed
+                            await asyncio.sleep(spin_duration)
+                            self.update_position(('spin', spin_angle), spin_duration)
+                            self.send_command("CMD_MOVE#1#0#0#8#0\n")
+
+            await asyncio.sleep(0.1)
+   
+   
+            test_point = (int(self.position[0]), int(self.position[1]))
+            matches = find_objects_at_point(test_point, objects_in_world)
+            print(test_point)
+            print(matches)
+   
+            if matches:
+                print(f"Point {test_point} found in objects:")
+                for obj in matches:
+                    print(f"- {obj['class_name']} (confidence: {obj['confidence']:.2f})")
+                    class_name = obj['class_name']
+                    frame_location = obj['frame_location'][0]
+                    confidence = obj['confidence']
+                    client = self
+                    object_not_seen_before = await handle_object_detection(channel, class_name, frame_location, confidence, None, client, config)
+                    print(object_not_seen_before)
+
+            # Add current position to visited cells
+            cell = (int(self.position[0] / self.grid_resolution),
+                int(self.position[1] / self.grid_resolution))
+            self.visited_cells.add(cell)
+            
+            # Store movement in path
+            movement = {
+                'movement': 'explore',
+                'spin_angle': 0,
+                'moved_forward': self.is_path_clear(),
+                'position': self.position,
+                'orientation': self.orientation,
+                'timestamp': time.time()
+            }
+            self.exploration_path.append(movement)
+
+        except Exception as e:
+            print(f"Error during exploration: {e}")
+            # Ensure robot stops on error
+            self.send_command("CMD_MOVE#1#0#0#8#0\n")
+    
+
+    async def random_explore(self, channel, config):
         """Performs exploration by spinning randomly and moving forward."""
         if not self.tcp_flag or not self.servo_power:
             return
@@ -488,21 +593,21 @@ class InsectClient:
             
             # Wait for spin to complete - scale wait time with angle
             spin_duration = abs(spin_angle) / 45  # Adjust this value based on actual robot speed
-            await asyncio.sleep(spin_duration)
+            await asyncio.sleep(0.1)
             
             # Update position to track the spin
             self.update_position(('spin', spin_angle), spin_duration)
             
             # Stop spinning
             self.send_command("CMD_MOVE#1#0#0#8#0\n")
-            await asyncio.sleep(0.5)  # Brief pause after spin
+            await asyncio.sleep(0.1)  # Brief pause after spin
 
             # Check if path is clear before moving forward
             if self.is_path_clear():
                 # Move forward
                 command = f"CMD_MOVE#1#0#35#8#0\n"  # Forward movement
                 self.send_command(command)
-                await asyncio.sleep(self.exploration_duration)
+                await asyncio.sleep(0.1)
                 
                 # Update position with forward movement
                 self.update_position(('w', None), self.exploration_duration)
@@ -511,26 +616,44 @@ class InsectClient:
                 self.send_command("CMD_MOVE#1#0#0#8#0\n")
             else:
                 print("Obstacle detected, skipping forward movement")
-                
+
+
+            test_point = (int(self.position[0]), int(self.position[1]))
+            matches = find_objects_at_point(test_point, objects_in_world)
+            print(matches)
+            print(test_point)
+   
+            if matches:
+                print(f"Point {test_point} found in objects:")
+                for obj in matches:
+                    print(f"- {obj['class_name']} (confidence: {obj['confidence']:.2f})")
+                    class_name = obj['class_name']
+                    frame_location = obj['frame_location'][0]
+                    confidence = obj['confidence']
+                    client = self
+                    object_not_seen_before = await handle_object_detection(channel, class_name, frame_location, confidence, None, client, config)
+                    print(object_not_seen_before)
+
             # Add current position to visited cells
             cell = (int(self.position[0] / self.grid_resolution),
                 int(self.position[1] / self.grid_resolution))
             self.visited_cells.add(cell)
             
             # Store movement in path
-            self.exploration_path.append({
+            movement = {
                 'movement': 'explore',
                 'spin_angle': spin_angle,
                 'moved_forward': self.is_path_clear(),
                 'position': self.position,
                 'orientation': self.orientation,
                 'timestamp': time.time()
-            })
+            }
+            self.exploration_path.append(movement)
 
         except Exception as e:
             print(f"Error during exploration: {e}")
             # Ensure robot stops on error
-            self.send_command("CMD_MOVE#1#0#0#8#0\n")            
+            self.send_command("CMD_MOVE#1#0#0#8#0\n")
     
     def start_exploration(self):
         """Enables random exploration mode."""
@@ -551,17 +674,20 @@ class InsectControl:
         self.last_detection_time = 0 
 
 
-    async def manage_exploration(self):
+    async def manage_exploration(self, channel, config):
         """Manages random exploration behavior."""
+        self.channel = channel
+        self.config = config
         while True:
             if self.client.exploring:
                 current_time = time.time()
                 if (current_time - self.client.last_exploration_time) >= self.client.exploration_interval:
                     # Only explore if we haven't seen anything new recently
                     if not what_ive_seen or (current_time - self.last_detection_time) > 15:
-                        await self.client.random_explore()
+                        # await self.client.random_explore(channel, config)
+                        await self.client.llm_explore(channel, config)
                         self.client.last_exploration_time = current_time
-            await asyncio.sleep(1)        
+            await asyncio.sleep(0.1)        
 
     def handle_movement(self, direction):
         x, y = 0, 0
@@ -695,19 +821,48 @@ class InsectControl:
             print("No detections available (YOLO disabled or no objects detected)")
 
 
-async def post(guild, channel, message):
-    if channel:
-        await channel.send(message)
-    else:
-        print('Guild not found when posting!')
+
+
+async def post(channel, message):
+    """Post a message to Discord, splitting into chunks if longer than 2000 chars."""
+    if not channel:
+        print('Channel not found when posting!')
+        return
+        
+    try:
+        # Split message into chunks of 2000 chars or less
+        msg_chunks = []
+        while len(message) > 2000:
+            # Find last newline or space before 2000 chars
+            split_point = message[:2000].rfind('\n')
+            if split_point == -1:
+                split_point = message[:2000].rfind(' ')
+            if split_point == -1:
+                split_point = 2000
+                
+            # Add chunk and remove from original message
+            msg_chunks.append(message[:split_point])
+            message = message[split_point:].strip()
+            
+        # Add remaining message as final chunk
+        if message:
+            msg_chunks.append(message)
+            
+        # Send all chunks
+        for chunk in msg_chunks:
+            if chunk.strip():  # Only send non-empty chunks
+                await channel.send(chunk)
+                
+    except Exception as e:
+        print(f'Error posting message to Discord: {e}')
+        
 
 
 
-
-async def llm_dynamic(obj, frame_location, llm_server):
-    return await llm_message(
+async def llm_dynamic(client, obj, frame_location, llm_server):
+    return await llm_message(client, 
 f'''
-I am an insect. I can issue the following commands.
+You are an insect. You can issue the following commands.
 
 Spin (<spin angle> should be between 45 and -45 degrees):
 
@@ -733,43 +888,129 @@ DO NOT OUTPUT ANYTHING OTHER THAN THE COMMANDS.
 
 
 
-async def llm_approach_flee_ignore(obj, llm_server):
-    return await llm_message(f'I am an insect. Given this object – {obj} – output a single word response: "approach", "flee" or "ignore".', llm_server) 
+async def llm_approach_flee_ignore(client, obj, llm_server):
+    return await llm_message(client, f'I am an insect. Given this object – {obj} – output a single word response: "approach", "flee" or "ignore".', llm_server) 
     
 
 
 
-async def llm_message(message, llm_server):
+async def llm_message(client, message, llm_server):
     """Send prompt to LLM and get response."""
+    sys_prompt = "You are an insect. You move around and explore things."
     try:
         # If Anthropic is not initialised, try local Ollama
         if llm_server.name != 'anthropic':
-            response: ChatResponse = chat(model=llm_server.model, messages=[
-            {
+            if len(client.stack_messages) == 0:
+                sys_prompt = {
+                'role': 'system',
+                'content': sys_prompt
+                }
+                client.stack_messages.append(sys_prompt)
+            query = {
                 'role': 'user',
                 'content': message,
-            },
-            ])
-            return response.message.content.strip().lower()
+            }
+            client.stack_messages.append(query)       
+            response: ChatResponse = chat(model=llm_server.model, messages=client.stack_messages)
+            answer = response.message.content.strip().lower()
+            answer_frame = {
+                'role': 'assistant',
+                'content': answer   
+            }
+            client.stack_messages.append(answer_frame)
+            # for m in client.stack_messages:
+            #     print(m['role'], m['content'][0:50])
+                        
+            if answer.startswith('<think>') and '</think>' in answer:
+                # Split into reasoning and actual answer
+                reasoning_end = answer.find('</think>') + len('</think>')
+                reasoning = answer[len('<think>'):reasoning_end - len('</think>')].strip()
+                actual_answer = answer[reasoning_end:].strip()
+                answer = (reasoning, actual_answer)
+            else:
+                answer = (None, answer)
+            return answer
         else:
+
+            query = {
+                'role': 'user',
+                'content': message,
+            }
+            client.stack_messages.append(query)       
+
             message = anthropic_client.messages.create(
                 model="claude-3-5-sonnet-20241022",
                 max_tokens=1000,
                 temperature=1.0,
-                system="You are an AI chatbot who imitates the narrator of Kafka's Metamorphosis very precisely.",
-                messages=[{
-                    "role": "user",
-                    "content": message
-                }]
+                system=sys_prompt,
+                messages=client.stack_messages
             )
-            return message.content.text
+            answer = message.content[0].text
+            answer_frame = {
+                'role': 'assistant',
+                'content': answer   
+            }            
+
+            client.stack_messages.append(answer_frame)
+            answer = (None, answer)
+            return answer
     except Exception as e:
         print(f"Error getting LLM response: {e}")
-        return None
+        return (None, None)
+
+async def handle_object_detection(channel, class_name, frame_location, confidence, insect_controller, insect_client, config):
+    object_not_seen_before = False
+    if config.llm_server.dynamic:
+        reasoning, response_to_object = await llm_dynamic(insect_client, class_name, frame_location, config.llm_server)
+    else:
+        reasoning, response_to_object = await llm_approach_flee_ignore(insect_client, class_name, config.llm_server)
+
+    # Create detection record
+    detection = DetectionRecord(
+        object_class=class_name,
+        timestamp=datetime.now(),
+        confidence=confidence,
+        position=insect_client.position,
+        orientation=insect_client.orientation,
+        frame_location=frame_location,
+        response_to_object=response_to_object
+    )
+
+    # Add to history if it's a new object
+    if class_name not in what_ive_seen:
+        insect_client.detection_history.append(detection)
+        what_ive_seen.append(class_name)
+        object_not_seen_before = True
+        
+        if config.discord_integration:
+            await post(channel, 
+                f'I just saw {class_name} at position {detection.position}, ' 
+                f'orientation {detection.orientation:.1f}° at {detection.timestamp.strftime("%H:%M:%S")}')
+            if reasoning is not None:
+                await post(channel, f'Based on the following reasoning:\n\n{reasoning}')
+            await post(channel, f'I am going to respond as follows:\n{response_to_object}')
+
+        if config.llm_server.dynamic:
+            lines = response_to_object.split('\n')
+            for line in lines:
+                insect_client.send_command(line + '\n')
+                await asyncio.sleep(1)  # Move for a second
+        else:
+
+            # Integrate with Insect Robot:
+            if response_to_object == "approach":
+                insect_controller.handle_movement('w')  # Move forward
+                await asyncio.sleep(1)  # Move for a second
+                insect_controller.stop_movement()
+            elif response_to_object == "flee":
+                insect_controller.handle_movement('s')  # Move backward
+                await asyncio.sleep(1)
+                insect_controller.stop_movement()
+        
+    return object_not_seen_before
 
     
-    
-async def run_realtime_detection(classes, guild, channel, insect_controller, config):
+async def run_realtime_detection(classes, channel, insect_controller, config):
     print("Starting realtime detection...")
    
     # Performance settings
@@ -802,7 +1043,7 @@ async def run_realtime_detection(classes, guild, channel, insect_controller, con
             
             if frame_count % FRAME_SKIP != 0:
                 # Show original frame without detection
-                if config.video_enabled:
+                if config.video_enabled and config.show_video:
                     cv2.imshow('Real-time Object Detection', insect_controller.client.frame)
                     # cv2.waitKey(1)
                 continue
@@ -816,7 +1057,6 @@ async def run_realtime_detection(classes, guild, channel, insect_controller, con
                 process_frame = cv2.resize(original_frame, (new_width, new_height))
             else:
                 process_frame = original_frame
-            original_frame = insect_controller.client.frame.copy()  # Make a copy to avoid modifying the original
            
             results = model_world(process_frame, stream=True, verbose=False)
             display_frame = original_frame.copy()  # For drawing detections
@@ -832,57 +1072,17 @@ async def run_realtime_detection(classes, guild, channel, insect_controller, con
                     # Get box center coordinates
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     frame_location = ((x1 + x2) // 2, (y1 + y2) // 2)
-                    
-                    if config.llm_server.dynamic:
-                        response_to_object = await llm_dynamic(class_name, frame_location, config.llm_server)
-                    else:
-                        response_to_object = await llm_approach_flee_ignore(class_name, config.llm_server)
 
+                    print(channel)
 
-                    # Create detection record
-                    detection = DetectionRecord(
-                        object_class=class_name,
-                        timestamp=datetime.now(),
-                        confidence=confidence,
-                        position=insect_controller.client.position,
-                        orientation=insect_controller.client.orientation,
-                        frame_location=frame_location,
-                        response_to_object=response_to_object
-                    )
+                    object_not_seen_before = await handle_object_detection(channel, class_name, frame_location, confidence, insect_controller, insect_controller.client, config)
 
-                    # Add to history if it's a new object
-                    if class_name not in what_ive_seen:
-                        post_image = True
-                        insect_controller.client.detection_history.append(detection)
-                        what_ive_seen.append(class_name)
-                        
-                        if config.discord_integration:
-                            await post(guild, channel, 
-                                f'I just saw {class_name} at position {detection.position}, ' 
-                                f'orientation {detection.orientation:.1f}° at {detection.timestamp.strftime("%H:%M:%S")}')
-                            await post(guild, channel, f'I am going to respond as follows:\n{response_to_object}')
-
-                            if config.llm_server.dynamic:
-                                lines = response_to_object.split('\n')
-                                for line in lines:
-                                    insect_controller.client.send_command(line + '\n')
-                                    await asyncio.sleep(1)  # Move for a second
-                            else:
-
-                                # Integrate with Insect Robot:
-                                if response_to_object == "approach":
-                                    insect_controller.handle_movement('w')  # Move forward
-                                    await asyncio.sleep(1)  # Move for a second
-                                    insect_controller.stop_movement()
-                                elif response_to_object == "flee":
-                                    insect_controller.handle_movement('s')  # Move backward
-                                    await asyncio.sleep(1)
-                                    insect_controller.stop_movement()
-                        
+                    if object_not_seen_before:
                         # Resume exploration after handling the object
                         await asyncio.sleep(2)
                         insect_controller.client.exploring = True
-                        
+                        post_image = True
+
                     # Draw bounding box on frame
                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                     color = COLORS[0].tolist()
@@ -892,7 +1092,7 @@ async def run_realtime_detection(classes, guild, channel, insect_controller, con
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
             # Show processed frame
-            if config.video_enabled:
+            if config.video_enabled and config.show_video:
                 cv2.imshow('Real-time Object Detection', display_frame)
                 cv2.waitKey(1)                    
             
@@ -928,7 +1128,7 @@ class RobotSettings:
     move_speed: int = 8
     min_safe_distance: float = 20.0
     exploration_interval: float = 5.0
-    exploration_duration: float = 2.0
+    exploration_duration: float = 0.5
     head_default_vertical: int = 90
     head_default_horizontal: int = 90
     sonar_interval: float = 1.0
@@ -978,10 +1178,11 @@ class ConfigManager:
         self.explore = False
         self.discord_integration = False
         self.video_enabled = True
+        self.show_video = True
         self.detection_enabled = False
         self.post_images = True
+        self.world_config = None
         
-
         if self.config_path.exists():
             self.load_config()
 
@@ -1007,8 +1208,10 @@ class ConfigManager:
         print(f"  Explore: {self.explore}")
         print(f"  Discord Integration: {self.discord_integration}")
         print(f"  Video Enabled: {self.video_enabled}")
+        print(f"  SHow Video: {self.show_video}")
         print(f"  Detection Enabled: {self.detection_enabled}")
         print(f"  Post Images: {self.post_images}")
+        print(f"  World Config: {self.world_config}")
 
 
     def load_config(self):
@@ -1022,8 +1225,10 @@ class ConfigManager:
                 self.explore = config.get('explore', self.explore)
                 self.discord_integration = config.get('discord_integration', self.discord_integration)
                 self.video_enabled = config.get('video_enabled', self.video_enabled)
+                self.show_video = config.get('show_video', self.show_video)
                 self.detection_enabled = config.get('detection_enabled', self.detection_enabled)
                 self.post_images = config.get('post_images', self.post_images)
+                self.world_config = config.get('world_config', self.world_config)
         except Exception as e:
             print(f"Error loading config: {e}")
     
@@ -1035,8 +1240,10 @@ class ConfigManager:
             'explore': self.explore,
             'discord_integration': self.discord_integration,
             'video_enabled': self.video_enabled,
+            'show_video': self.show_video,
             'detection_enabled': self.detection_enabled,
-            'post_images': self.post_images
+            'post_images': self.post_images,
+            'world_config': self.world_config
         }
         with open(self.config_path, 'w') as f:
             json.dump(config, f, indent=4)
@@ -1101,23 +1308,27 @@ class KeyboardController:
         """Send LLM's response to discord."""
         try:
             memories = self.create_prompt_for_a_plan(self.control.client)
-            response = await llm_message(memories, self.llm_server)
+            reasoning, response = await llm_message(memories, self.llm_server)
             
             if response and self.guild and self.channel:
-                await post(self.guild, self.channel, memories[0:2000])
-                await post(self.guild, self.channel, response[0:2000])
+                await post(self.channel, memories)
+                if reasoning is not None:
+                    await post(self.channel, reasoning)
+                await post(self.channel, response)
         except Exception as e:
-            print(f"Error in muse function: {e}")
+            print(f"Error in jump around function: {e}")
 
     async def muse(self):
         """Send LLM's response to discord."""
         try:
             memories = self.create_prompt_for_reflection(self.control.client)
-            response = await llm_message(memories, self.llm_server)
+            reasoning, response = await llm_message(memories, self.llm_server)
             
             if response and self.guild and self.channel:
-                await post(self.guild, self.channel, memories[0:2000])
-                await post(self.guild, self.channel, response[0:2000])
+                await post(self.channel, memories[0:2000])
+                if reasoning is not None:
+                    await post(self.channel, reasoning)
+                await post(self.channel, response[0:2000])
         except Exception as e:
             print(f"Error in muse function: {e}")
                         
@@ -1125,7 +1336,7 @@ class KeyboardController:
     async def print_history(self):
         """Send LLM's response to discord."""
         history = self.control.client.get_detection_history_string()
-        await post(self.guild, self.channel, history[0:2000])
+        await post(self.channel, history)
             
     def register_discord(self, guild, channel):
         self.guild = guild
@@ -1500,8 +1711,86 @@ async def shutdown(tasks, insect_controller, discord_client):
 
     print("Shutdown complete.")
 
+
+def load_objects_in_world(world_config):
+    global objects_in_world
+    try:
+        
+        if world_config is None:
+            return 
+                
+        with open(world_config, 'r') as file:
+            objects_in_world = json.load(file)
+            
+        # Validate the structure of each detection
+        for detection in objects_in_world:
+            if not all(key in detection for key in ['class_name', 'frame_location', 'confidence']):
+                raise ValueError("Invalid detection format - missing required fields")
+            
+            if not isinstance(detection['frame_location'], list) or len(detection['frame_location']) != 4:
+                raise ValueError("Invalid frame_location format - must be list of 4 corner points")
+                
+            for point in detection['frame_location']:
+                if not isinstance(point, list) or len(point) != 2:
+                    raise ValueError("Invalid corner point format - each corner must be [x,y] coordinates")
+                if not all(isinstance(coord, (int, float)) for coord in point):
+                    raise ValueError("Invalid coordinate format - coordinates must be numbers")
+                
+            if not isinstance(detection['confidence'], (int, float)) or not 0 <= detection['confidence'] <= 1:
+                raise ValueError("Invalid confidence value - must be float between 0 and 1")
+                
+        return objects_in_world
+        
+    except FileNotFoundError:
+        print("Error: detection_samples.json file not found")
+        return None
+    
+
+
+def point_in_rectangle(point, rectangle_points):
+    """
+    Determines if a point is inside a rectangle.
+    
+    Args:
+        point: [x, y] coordinates to test
+        rectangle_points: List of 4 points [[x1,y1], [x2,y2], [x3,y3], [x4,y4]] defining rectangle corners
+    
+    Returns:
+        bool: True if point is inside rectangle, False otherwise
+    """
+    # Convert point and rectangle to more manageable format
+    x, y = point
+    
+    # Find the minimum and maximum x and y coordinates of the rectangle
+    x_coords = [p[0] for p in rectangle_points]
+    y_coords = [p[1] for p in rectangle_points]
+    
+    min_x, max_x = min(x_coords), max(x_coords)
+    min_y, max_y = min(y_coords), max(y_coords)
+    
+    # Check if point is within bounds
+    return (min_x <= x <= max_x) and (min_y <= y <= max_y)
+def find_objects_at_point(point, objects_in_world):
+    """
+    Returns list of all objects that contain the given point
+    
+    Args:
+        point: [x, y] coordinates to test
+        objects_in_world: List of objects with frame_location property
+        
+    Returns:
+        list: Objects that contain the point
+    """
+    matching_objects = []
+    
+    for obj in objects_in_world:
+        if point_in_rectangle(point, obj['frame_location']):
+            matching_objects.append(obj)
+            
+    return matching_objects
+    
 async def main():
-    global anthropic_client
+    global anthropic_client, message_stack
 
     args = parse_args()
     config = ConfigManager(args.config)
@@ -1523,6 +1812,10 @@ async def main():
                                           config.robot.sonar_interval):
         print("Failed to connect to robot")
         return
+    
+    # Load objects
+    print(config)
+    load_objects_in_world(config.world_config)
 
     # Store tasks for cleanup
     active_tasks = set()
@@ -1535,18 +1828,17 @@ async def main():
 
         # Create and add tasks
         if config.video_enabled:
-            preview_task = asyncio.create_task(keyboard.preview_loop())
+            # preview_task = asyncio.create_task(keyboard.preview_loop())
             status_task = asyncio.create_task(keyboard.display_recording_status())
-            active_tasks.update({preview_task, status_task})
+            active_tasks.update({status_task})
+            # active_tasks.update({preview_task, status_task})
         
         input_task = asyncio.create_task(keyboard.input_loop())
         active_tasks.add(input_task)
-        
-        if config.explore:
-            exploration_task = asyncio.create_task(insect_controller.manage_exploration())
-            active_tasks.add(exploration_task)
 
         # Set up Discord if enabled
+        discord_guild = None
+        discord_channel = None
         if config.discord_integration:
             discord_client = setup_discord(config.discord, insect_controller, keyboard, config)
             if discord_client:
@@ -1557,24 +1849,22 @@ async def main():
                 await discord_client.ready_event.wait()
 
                 # Register Discord guild and channel with keyboard controller
-                guild = discord.utils.get(discord_client.guilds, id=config.discord.guild_id)
-                if guild:
-                    channel = discord.utils.get(guild.text_channels, id=config.discord.channel_id)
-                    keyboard.register_discord(guild, channel)
+                discord_guild = discord.utils.get(discord_client.guilds, id=config.discord.guild_id)
+                if discord_guild:
+                    discord_channel = discord.utils.get(discord_guild.text_channels, id=config.discord.channel_id)
+                    keyboard.register_discord(discord_guild, discord_channel)
+
+        if config.explore:
+            exploration_task = asyncio.create_task(insect_controller.manage_exploration(discord_channel, config))
+            active_tasks.add(exploration_task)
+            insect_controller.client.exploring = True
+
 
         # Then set up detection after Discord is ready
         if config.detection_enabled:
             insect_controller.client.yolo_enabled = True
-            
-            discord_guild = None
-            discord_channel = None
-            if config.discord_integration and discord_client:
-                discord_guild = discord.utils.get(discord_client.guilds, id=config.discord.guild_id)
-                if discord_guild:
-                    discord_channel = discord.utils.get(discord_guild.text_channels, id=config.discord.channel_id)
-            
             detection_task = asyncio.create_task(
-                run_realtime_detection([], discord_guild, discord_channel, insect_controller, config)
+                run_realtime_detection([], discord_channel, insect_controller, config)
             )
             active_tasks.add(detection_task)
 
@@ -1598,7 +1888,7 @@ async def main():
             keyboard.quit()
         await shutdown(active_tasks, insect_controller, discord_client)
 
-
+    
 
 if __name__ == "__main__":
     try:
@@ -1610,4 +1900,6 @@ if __name__ == "__main__":
     finally:
         # Force close any remaining windows
         cv2.destroyAllWindows()
-        print("\nShutdown complete.")   
+        print("\nShutdown complete.")
+
+    

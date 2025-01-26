@@ -47,12 +47,14 @@
   },
   "explore": true,
   "discord_integration": true,
-  "video_enabled": true,
-  "detection_enabled": true,
+  "video_enabled": false,
+  "show_video": false,
+  "detection_enabled": false,
   "post_images": false,
+  "world_config": "./world.json",
   "llm_server": {
-    "name": "ollama",
-    "model": "llama3.2:3b",
+    "name": "anthropic",
+    "model": "deepseek-r1:8b",
     "dynamic": true
   }
 }

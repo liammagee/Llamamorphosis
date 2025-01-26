@@ -1,0 +1,42 @@
+[
+    {
+      "class_name": "Rabbit",
+      "frame_location": [[25, 35], [75, 35], [75, -45], [25, -45]],
+      "confidence": 0.87
+    },
+    {
+      "class_name": "Cat", 
+      "frame_location": [[45, -15], [55, -15], [55, -5], [45, -5]],
+      "confidence": 0.92
+    },
+    {
+      "class_name": "Dog",
+      "frame_location": [[-75, -45], [-65, -45], [-65, -35], [-75, -35]],
+      "confidence": 0.76
+    },
+    {
+      "class_name": "Bird",
+      "frame_location": [[15, -85], [25, -85], [25, -75], [15, -75]],
+      "confidence": 0.65
+    },
+    {
+      "class_name": "Squirrel",
+      "frame_location": [[-15, 25], [-5, 25], [-5, 35], [-15, 35]],
+      "confidence": 0.81
+    },
+    {
+      "class_name": "Rabbit",
+      "frame_location": [[35, -25], [45, -25], [45, -15], [35, -15]],
+      "confidence": 0.94
+    },
+    {
+      "class_name": "Fox",
+      "frame_location": [[-45, 15], [-35, 15], [-35, 25], [-45, 25]],
+      "confidence": 0.72
+    },
+    {
+      "class_name": "Deer",
+      "frame_location": [[25, 15], [35, 15], [35, 25], [25, 25]],
+      "confidence": 0.88
+    }
+  ]
