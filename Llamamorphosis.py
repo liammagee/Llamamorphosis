@@ -3,6 +3,9 @@ Modular robot control system with configurable settings and command-line options
 """
 
 from anthropic import Anthropic
+from openai import OpenAI
+from groq import Groq
+
 import argparse
 import asyncio
 import inspect
@@ -45,8 +48,9 @@ channel = None
 anthropic = None
 what_ive_seen = []
 objects_in_world = []
+move_speed = 5  # estimated cm/s when moving
 
-anthropic_client=None
+llm_client=None
 
 
 class COMMAND:
@@ -89,7 +93,7 @@ class InsectClient:
         self.video_writer = None
         self.yolo_enabled = False
         self.detected_objects = []
-        self.move_speed = "8"
+        self.move_speed = 10
         self.servo_power = True
         self.balance_mode = False
         self.head_position = {"vertical": 90, "horizontal": 90}
@@ -98,14 +102,23 @@ class InsectClient:
         self.sonar_lock = threading.Lock()
         self.exploring = False
         self.last_exploration_time = time.time()
-        self.exploration_interval = 5  
+        self.exploration_interval = 1.0
         self.exploration_duration = 0.5
         self.recording_start_time = None
         self.current_recording_file = None        
         self.buzzing = None        
         self.exploration_path = []  
         self.position = (0, 0)  
-        self.orientation = 0  
+        self.orientation = random.random() * 2 * math.pi  
+        self.waypoints = []  
+        self.current_waypoint_index = 0  
+        self.waypoint_reached = False  
+        self.waypoint_reached_time = None  
+        self.waypoint_reached_duration = 1.0  
+        self.waypoint_reached_flag = False  
+        self.waypoint_reached_lock = threading.Lock()  
+        self.waypoint_reached_condition = threading.Condition(self.waypoint_reached_lock)  
+        self.waypoint_reached_event = threading.Event()  
         self.grid_resolution = 50  
         self.visited_cells = set()  
         self.spin_probability = 0.3  
@@ -417,10 +430,9 @@ class InsectClient:
 
     def update_position(self, movement, duration):
         """Update the robot's estimated position and orientation."""
-        move_speed = 20  # estimated cm/s when moving
         
         if movement[0] in ['w', 's']:  # Forward/backward movement
-            distance = move_speed * duration * (1 if movement[0] == 'w' else -1)
+            distance = self.move_speed * duration * (1 if movement[0] == 'w' else -1)
             # Calculate new position based on current orientation
             angle_rad = math.radians(self.orientation)
             dx = distance * math.sin(angle_rad)
@@ -437,7 +449,7 @@ class InsectClient:
         # Update orientation for spin movements
         if movement[0] == 'spin':
             self.orientation = (self.orientation + movement[1]) % 360
-            
+
         # Convert current position to grid cell
         cell = (int(self.position[0]),
                 int(self.position[1]))
@@ -514,21 +526,39 @@ class InsectClient:
 
             my_history = ''
 
-            for pos in self.visited_cells:
-                my_history += f"({pos[0]}, {pos[1]})" + '\n'
+            if len(self.visited_cells) > 0:
+                if len(self.visited_cells) > 8:
+                    # Calculate the logarithm of the size of the list (base 10)
+                    log_size = 5 + int(math.log(len(self.visited_cells), 2))  # Base 10 logarithm
+
+                    # Ensure at least one selection
+                    log_size = max(log_size, 1)
+
+                    # Randomly select `log_size` elements
+                    random_selection = random.sample(sorted(self.visited_cells), log_size)
+                    
+                    for pos in random_selection:
+                        my_history += f"({pos[0]}, {pos[1]})" + '\n'
+                else:
+                    for pos in self.visited_cells:
+                        my_history += f"({pos[0]}, {pos[1]})" + '\n'
+
             my_world = self.detection_history_to_string()
+
             instruction = f'''
-You are an insect. You can issue the following commands:
+You are an insect. You can issue the following commands. Each uses a variant of CMD_MOVE, to move, rotate or stop.
 
-To rotate (<spin angle> should be between 90 and -90 degrees):
+To rotate:
 
-    CMD_MOVE#2#0#0#8#<spin angle>
+    CMD_MOVE#2#0#0#8#90
 
+Where the last parameter 90 is the angle in degrees. Positive is clockwise, negative is counterclockwise. Pick a number between 180 and -180.
 
 To move forward:
 
     CMD_MOVE#1#0#10#8#0
 
+Where the 3rd parameter is the distance forward. 
     
 Stop movement:
     
@@ -536,7 +566,7 @@ Stop movement:
     
 NOTE THAT ALL VALID COMMANDS COMMENCE WITH 'CMD_MOVE'. DO NOT USE 'CMD_ROTATE'. ALWAYS TERMINATE WITH STOP: 'CMD_MOVE#1#0#0#8#0'.
 
-This is the history of your movement: {my_history}
+This is the rough history of your movement: {my_history}
 
 And here is the world you have discovered so far:
 
@@ -544,36 +574,47 @@ And here is the world you have discovered so far:
 
 Think about where you have been and what you have seen. Where should you go next? You really want to visit new locations, even if it means choosing directions that are not at 90 degree angles.
 
-Remember your world is a 2D grid, with coordinates between (-100, -100) and (100, 100). Don't try to visit locations outside of this grid.
+Remember your world is a 2D grid, with coordinates between (-100, -100) and (100, 100). Don't try to visit locations outside of this grid. Vary things up; use random angles and distances if you're getting stuck, or head for home (0, 0).
+
+IMPORTANT: But review the objects you have seen and whether you want to move toward or away from them. 
 
 To travel to where you want to go next, you need to issue a sequence of commands using the syntax above: rotate, move forward, stop. Each command should be separated by a line break.
 
 ONLY OUTPUT THE COMMANDS THEMSELVES. PRINT EACH COMMAND ON A NEW LINE. THE COMMAND SHOULD BEGIN AT THE START OF THE LINE. DO NOT ADD OTHER CHARACTERS. 
 
+REMEMBER: to NOT use CMD_ROTATE, but instead a variant of CMD_MOVE#2.
+
 '''
 
+            reasoning, response = await llm_message(self, instruction, config.llm_server)         
             print("my_history", my_history)
             print("my_world", my_world)
-            reasoning, response = await llm_message(self, instruction, config.llm_server)         
+            # print(instruction)
+            # print(response)
+            if reasoning:
+                print("reasoning", reasoning[0:100])
 
-            for command in response.split('\n'):
-                command = command.lstrip('`*').upper()
-                if command.upper().startswith('CMD_MOVE'):
-                    if command.startswith('CMD_MOVE#1'):
-                        if self.is_path_clear():
-                            self.send_command(command)
-                            self.update_position(('w', None), self.exploration_duration)
-                            await asyncio.sleep(self.exploration_duration)
-                            self.send_command("CMD_MOVE#1#0#0#8#0\n")
-                    elif command.startswith('CMD_MOVE#2'):
-                        spin_angle = float(command.split('#')[5])  # Extract spin angle from last parameter
-                        if spin_angle is not None:
-                            spin_duration = abs(spin_angle) / 45  # Adjust this value based on actual robot speed
-                            await asyncio.sleep(spin_duration)
-                            self.update_position(('spin', spin_angle), spin_duration)
-                            self.send_command("CMD_MOVE#1#0#0#8#0\n")
+            if response is not None: 
+                for command in response.split('\n'):
+                    command = command.lstrip('`*').upper()
+                    if command.upper().startswith('CMD_MOVE'):
+                        if command.startswith('CMD_MOVE#1'):
+                            if self.is_path_clear():
+                                self.send_command(command)
+                                self.update_position(('w', None), self.exploration_duration)
+                                # await asyncio.sleep(self.exploration_duration)
+                                await asyncio.sleep(0.1)
+                                self.send_command("CMD_MOVE#1#0#0#8#0\n")
+                        elif command.startswith('CMD_MOVE#2'):
+                            spin_angle = float(command.split('#')[5])  # Extract spin angle from last parameter
+                            if spin_angle is not None:
+                                spin_duration = abs(spin_angle) / 45  # Adjust this value based on actual robot speed
+                                # await asyncio.sleep(spin_duration)
+                                await asyncio.sleep(0.1)
+                                self.update_position(('spin', spin_angle), spin_duration)
+                                self.send_command("CMD_MOVE#1#0#0#8#0\n")
 
-            await asyncio.sleep(0.1)
+                await asyncio.sleep(0.1)
    
    
             test_point = (int(self.position[0]), int(self.position[1]))
@@ -581,7 +622,6 @@ ONLY OUTPUT THE COMMANDS THEMSELVES. PRINT EACH COMMAND ON A NEW LINE. THE COMMA
             print(test_point)
             print(matches)
 
-   
             if matches:
                 print(f"Point {test_point} found in objects:")
                 for obj in matches:
@@ -716,13 +756,15 @@ class InsectControl:
         while True:
             if self.client.exploring:
                 current_time = time.time()
-                if (current_time - self.client.last_exploration_time) >= self.client.exploration_interval:
-                    # Only explore if we haven't seen anything new recently
-                    if not what_ive_seen or (current_time - self.last_detection_time) > 15:
-                        # await self.client.random_explore(channel, config)
-                        await self.client.llm_explore(channel, config)
-                        self.client.last_exploration_time = current_time
-            await asyncio.sleep(0.1)        
+                await self.client.llm_explore(channel, config)
+                self.client.last_exploration_time = current_time
+                # if (current_time - self.client.last_exploration_time) >= self.client.exploration_interval:
+                #     # Only explore if we haven't seen anything new recently
+                #     if not what_ive_seen or (current_time - self.last_detection_time) > 15:
+                #         # await self.client.random_explore(channel, config)
+                #         await self.client.llm_explore(channel, config)
+                #         self.client.last_exploration_time = current_time
+            await asyncio.sleep(0.1) 
 
     def handle_movement(self, direction):
         x, y = 0, 0
@@ -934,27 +976,29 @@ async def llm_message(client, message, llm_server):
     sys_prompt = "You are an insect. You move around and explore things."
     try:
         # If Anthropic is not initialised, try local Ollama
-        if llm_server.name != 'anthropic':
-            if len(client.stack_messages) == 0:
-                sys_prompt = {
+        if llm_server.name not in ['anthropic', 'openai', 'deepseek', 'groq']:
+            sys_prompt_message = {
                 'role': 'system',
                 'content': sys_prompt
-                }
-                client.stack_messages.append(sys_prompt)
+            }
+            if len(client.stack_messages) == 0:
+                client.stack_messages.append(sys_prompt_message)
             query = {
                 'role': 'user',
                 'content': message,
             }
+            simple_messages = [
+                sys_prompt_message, query
+            ]
             client.stack_messages.append(query)       
-            response: ChatResponse = chat(model=llm_server.model, messages=client.stack_messages)
+            # response: ChatResponse = chat(model=llm_server.model, messages=client.stack_messages)
+            response: ChatResponse = chat(model=llm_server.model, messages=simple_messages)
             answer = response.message.content.strip().lower()
             answer_frame = {
                 'role': 'assistant',
                 'content': answer   
             }
             client.stack_messages.append(answer_frame)
-            # for m in client.stack_messages:
-            #     print(m['role'], m['content'][0:50])
                         
             if answer.startswith('<think>') and '</think>' in answer:
                 # Split into reasoning and actual answer
@@ -965,7 +1009,44 @@ async def llm_message(client, message, llm_server):
             else:
                 answer = (None, answer)
             return answer
-        else:
+        elif llm_server.name == 'deepseek' or llm_server.name == 'groq':
+            sys_prompt_message = {
+                'role': 'system',
+                'content': sys_prompt
+            }
+            if len(client.stack_messages) == 0:
+                client.stack_messages.append(sys_prompt_message)
+            query = {
+                'role': 'user',
+                'content': message,
+            }
+            simple_messages = [
+                sys_prompt_message, query
+            ]
+            client.stack_messages.append(query)  
+            response = llm_client.chat.completions.create(
+                model=llm_server.model,
+                messages=simple_messages,
+                stream=False
+            )
+            answer = response.choices[0].message.content.strip().lower()
+            answer_frame = {
+                'role': 'assistant',
+                'content': answer   
+            }
+            client.stack_messages.append(answer_frame)
+
+            if answer.startswith('<think>') and '</think>' in answer:
+                # Split into reasoning and actual answer
+                reasoning_end = answer.find('</think>') + len('</think>')
+                reasoning = answer[len('<think>'):reasoning_end - len('</think>')].strip()
+                actual_answer = answer[reasoning_end:].strip()
+                answer = (reasoning, actual_answer)
+            else:
+                answer = (None, answer)
+            return answer
+
+        elif llm_server.name == 'anthropic':
 
             query = {
                 'role': 'user',
@@ -973,7 +1054,7 @@ async def llm_message(client, message, llm_server):
             }
             client.stack_messages.append(query)       
 
-            message = anthropic_client.messages.create(
+            message = llm_client.messages.create(
                 model="claude-3-5-sonnet-20241022",
                 max_tokens=1000,
                 temperature=1.0,
@@ -996,12 +1077,13 @@ async def llm_message(client, message, llm_server):
 async def handle_object_detection_no_movement(channel, class_name, frame_location, confidence, insect_controller, insect_client, config):
     object_not_seen_before = False
 
+    position_int = tuple(map(int, insect_client.position))
     # Create detection record
     detection = DetectionRecord(
         object_class=class_name,
         timestamp=datetime.now(),
         confidence=confidence,
-        position=insect_client.position,
+        position=position_int,
         orientation=insect_client.orientation,
         frame_location=frame_location,
         response_to_object=''
@@ -1189,7 +1271,7 @@ class RobotSettings:
     video_port: int = 8002
     move_speed: int = 8
     min_safe_distance: float = 20.0
-    exploration_interval: float = 5.0
+    exploration_interval: float = 1.0
     exploration_duration: float = 0.5
     head_default_vertical: int = 90
     head_default_horizontal: int = 90
@@ -1852,7 +1934,7 @@ def find_objects_at_point(point, objects_in_world):
     return matching_objects
     
 async def main():
-    global anthropic_client, message_stack
+    global llm_client, message_stack
 
     args = parse_args()
     config = ConfigManager(args.config)
@@ -1862,8 +1944,23 @@ async def main():
         api_key = os.getenv('ANTHROPIC_API_KEY')
         if not api_key:
             raise ValueError("No Anthropic key set in the environment.")
-        anthropic_client = Anthropic(api_key=api_key)
-
+        llm_client = Anthropic(api_key=api_key)
+    elif config.llm_server.name == 'deepseek':
+        api_key = os.getenv('DEEPSEEK_API_KEY')
+        if not api_key:
+            raise ValueError("No DeepSeek key set in the environment.")
+        llm_client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+    elif config.llm_server.name == 'groq':
+        api_key = os.getenv('GROQ_API_KEY')
+        if not api_key:
+            raise ValueError("No DeepSeek key set in the environment.")
+        llm_client = Groq(api_key=api_key,)
+    elif config.llm_server.name == 'groq':
+        api_key = os.getenv('GROQ_API_KEY')
+        if not api_key:
+            raise ValueError("No DeepSeek key set in the environment.")
+        llm_client = OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
+ 
     # Initialize robot controller
     insect_controller = InsectControl()
     

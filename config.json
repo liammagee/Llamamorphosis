@@ -54,7 +54,7 @@
   "world_config": "./world.json",
   "llm_server": {
     "name": "anthropic",
-    "model": "deepseek-r1:8b",
+    "model": "claude-3-5-sonnet-20241022",
     "dynamic": true
   }
 }
