@@ -439,8 +439,8 @@ class InsectClient:
             self.orientation = (self.orientation + movement[1]) % 360
             
         # Convert current position to grid cell
-        cell = (int(self.position[0] / self.grid_resolution),
-                int(self.position[1] / self.grid_resolution))
+        cell = (int(self.position[0]),
+                int(self.position[1]))
         self.visited_cells.add(cell)
         
         # Store movement in path
@@ -478,6 +478,30 @@ class InsectClient:
         elif move == 'd': x += 1
         return (x, y)
 
+    def detection_history_to_string(self) -> str:
+        """Convert detection history to a tabular string format."""
+        if not self.detection_history:
+            return "No detections recorded"
+        
+        # Create header
+        header = f"{'Object':<15} {'Time':<20} {'Conf':<6} {'Position':<15} {'Orient':<10} {'Response':<20}"
+        separator = "-" * len(header)
+        
+        # Create rows
+        rows = []
+        for detection in self.detection_history:
+            pos_str = f"({detection.position[0]:.1f}, {detection.position[1]:.1f})"
+            rows.append(
+                f"{detection.object_class:<15} "
+                f"{detection.timestamp.strftime('%Y-%m-%d %H:%M:%S'):<20} "
+                f"{detection.confidence:.2f} "
+                f"{pos_str:<15} "
+                f"{detection.orientation:.1f}°{' ':<4} "
+                f"{detection.response_to_object:<20}"
+            )
+        
+        return f"{header}\n{separator}\n" + "\n".join(rows)
+
     async def llm_explore(self, channel, config):
         """Performs exploration by spinning randomly and moving forward."""
         if not self.tcp_flag or not self.servo_power:
@@ -489,12 +513,14 @@ class InsectClient:
             frame_location = (int(self.position[0]), int(self.position[1]))
 
             my_history = ''
+
             for pos in self.visited_cells:
                 my_history += f"({pos[0]}, {pos[1]})" + '\n'
+            my_world = self.detection_history_to_string()
             instruction = f'''
 You are an insect. You can issue the following commands:
 
-To rotate (<spin angle> should be between 45 and -45 degrees):
+To rotate (<spin angle> should be between 90 and -90 degrees):
 
     CMD_MOVE#2#0#0#8#<spin angle>
 
@@ -512,14 +538,22 @@ NOTE THAT ALL VALID COMMANDS COMMENCE WITH 'CMD_MOVE'. DO NOT USE 'CMD_ROTATE'. 
 
 This is the history of your movement: {my_history}
 
-To travel to where you want to go next, you need to issue a sequence of commands using the syntax above: rotate, move forward, stop. Each command should be separated by a line break.
+And here is the world you have discovered so far:
 
-Where should you go next? You really want to visit new locations, even if it means choosing directions that are not at 90 degree angles.
+{my_world}
+
+Think about where you have been and what you have seen. Where should you go next? You really want to visit new locations, even if it means choosing directions that are not at 90 degree angles.
+
+Remember your world is a 2D grid, with coordinates between (-100, -100) and (100, 100). Don't try to visit locations outside of this grid.
+
+To travel to where you want to go next, you need to issue a sequence of commands using the syntax above: rotate, move forward, stop. Each command should be separated by a line break.
 
 ONLY OUTPUT THE COMMANDS THEMSELVES. PRINT EACH COMMAND ON A NEW LINE. THE COMMAND SHOULD BEGIN AT THE START OF THE LINE. DO NOT ADD OTHER CHARACTERS. 
 
 '''
 
+            print("my_history", my_history)
+            print("my_world", my_world)
             reasoning, response = await llm_message(self, instruction, config.llm_server)         
 
             for command in response.split('\n'):
@@ -546,21 +580,21 @@ ONLY OUTPUT THE COMMANDS THEMSELVES. PRINT EACH COMMAND ON A NEW LINE. THE COMMA
             matches = find_objects_at_point(test_point, objects_in_world)
             print(test_point)
             print(matches)
+
    
             if matches:
                 print(f"Point {test_point} found in objects:")
                 for obj in matches:
-                    print(f"- {obj['class_name']} (confidence: {obj['confidence']:.2f})")
+                    print(f"- {obj['class_name']} (confidence: {obj['confidence']})")
                     class_name = obj['class_name']
                     frame_location = obj['frame_location'][0]
                     confidence = obj['confidence']
                     client = self
-                    object_not_seen_before = await handle_object_detection(channel, class_name, frame_location, confidence, None, client, config)
+                    object_not_seen_before = await handle_object_detection_no_movement(channel, class_name, frame_location, confidence, None, client, config)
                     print(object_not_seen_before)
-
             # Add current position to visited cells
-            cell = (int(self.position[0] / self.grid_resolution),
-                int(self.position[1] / self.grid_resolution))
+            cell = (int(self.position[0]),
+                int(self.position[1]))
             self.visited_cells.add(cell)
             
             # Store movement in path
@@ -626,14 +660,15 @@ ONLY OUTPUT THE COMMANDS THEMSELVES. PRINT EACH COMMAND ON A NEW LINE. THE COMMA
             if matches:
                 print(f"Point {test_point} found in objects:")
                 for obj in matches:
-                    print(f"- {obj['class_name']} (confidence: {obj['confidence']:.2f})")
+                    print(f"- {obj['class_name']} (confidence: {obj['confidence']})")
                     class_name = obj['class_name']
                     frame_location = obj['frame_location'][0]
                     confidence = obj['confidence']
                     client = self
                     object_not_seen_before = await handle_object_detection(channel, class_name, frame_location, confidence, None, client, config)
                     print(object_not_seen_before)
-
+                    object_not_seen_before = await handle_object_detection(channel, class_name, frame_location, confidence, None, client, config)
+                    print(object_not_seen_before)
             # Add current position to visited cells
             cell = (int(self.position[0] / self.grid_resolution),
                 int(self.position[1] / self.grid_resolution))
@@ -816,7 +851,7 @@ class InsectControl:
         if self.client.yolo_enabled and self.client.detected_objects:
             print("\nCurrent detections:")
             for obj in self.client.detected_objects:
-                print(f"- {obj['class']}: {obj['confidence']:.2f}")
+                print(f"- {obj['class']}: {obj['confidence']}")
         else:
             print("No detections available (YOLO disabled or no objects detected)")
 
@@ -958,6 +993,34 @@ async def llm_message(client, message, llm_server):
         print(f"Error getting LLM response: {e}")
         return (None, None)
 
+async def handle_object_detection_no_movement(channel, class_name, frame_location, confidence, insect_controller, insect_client, config):
+    object_not_seen_before = False
+
+    # Create detection record
+    detection = DetectionRecord(
+        object_class=class_name,
+        timestamp=datetime.now(),
+        confidence=confidence,
+        position=insect_client.position,
+        orientation=insect_client.orientation,
+        frame_location=frame_location,
+        response_to_object=''
+    )
+
+    # Add to history if it's a new object
+    if not any(d.object_class == class_name for d in insect_client.detection_history):
+        insect_client.detection_history.append(detection)
+        what_ive_seen.append(class_name)
+        object_not_seen_before = True
+        
+        if config.discord_integration:
+            await post(channel, 
+                f'I just saw {class_name} at position {detection.position}, ' 
+                f'orientation {detection.orientation:.1f}° at {detection.timestamp.strftime("%H:%M:%S")}')
+
+    return object_not_seen_before
+
+
 async def handle_object_detection(channel, class_name, frame_location, confidence, insect_controller, insect_client, config):
     object_not_seen_before = False
     if config.llm_server.dynamic:
@@ -977,7 +1040,7 @@ async def handle_object_detection(channel, class_name, frame_location, confidenc
     )
 
     # Add to history if it's a new object
-    if class_name not in what_ive_seen:
+    if not any(d.object_class == class_name for d in insect_client.detection_history):
         insect_client.detection_history.append(detection)
         what_ive_seen.append(class_name)
         object_not_seen_before = True
@@ -1009,7 +1072,6 @@ async def handle_object_detection(channel, class_name, frame_location, confidenc
         
     return object_not_seen_before
 
-    
 async def run_realtime_detection(classes, channel, insect_controller, config):
     print("Starting realtime detection...")
    
