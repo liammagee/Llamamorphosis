@@ -109,7 +109,7 @@ class InsectClient:
         self.buzzing = None        
         self.exploration_path = []  
         self.position = (0, 0)  
-        self.orientation = random.random() * 2 * math.pi  
+        self.orientation = random.random() * 360 - 180
         self.waypoints = []  
         self.current_waypoint_index = 0  
         self.waypoint_reached = False  
@@ -428,8 +428,11 @@ class InsectClient:
             self.video_socket.close()
         print("Disconnected from insect robot")
 
+        
     def update_position(self, movement, duration):
         """Update the robot's estimated position and orientation."""
+        
+        start_pos = self.position
         
         if movement[0] in ['w', 's']:  # Forward/backward movement
             distance = self.move_speed * duration * (1 if movement[0] == 'w' else -1)
@@ -450,19 +453,38 @@ class InsectClient:
         if movement[0] == 'spin':
             self.orientation = (self.orientation + movement[1]) % 360
 
-        # Convert current position to grid cell
-        cell = (int(self.position[0]),
-                int(self.position[1]))
-        self.visited_cells.add(cell)
-        
-        # Store movement in path
-        self.exploration_path.append({
-            'movement': movement,
-            'position': self.position,
-            'orientation': self.orientation,
-            'timestamp': time.time()
-        })
-        
+        # Calculate all cells between start and end position using Bresenham's line algorithm
+        start_cell = (int(start_pos[0]), int(start_pos[1]))
+        end_cell = (int(self.position[0]), int(self.position[1]))
+        line_cells = self.get_line_cells(start_cell[0], start_cell[1], end_cell[0], end_cell[1])
+        self.visited_cells.update(line_cells)
+
+
+    def get_line_cells(self, x0, y0, x1, y1):
+        """Get all cells that lie on a line between two points using Bresenham's algorithm."""
+        cells = set()
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        x, y = x0, y0
+        x_inc = 1 if x1 > x0 else -1
+        y_inc = 1 if y1 > y0 else -1
+        error = dx - dy
+        dx *= 2
+        dy *= 2
+
+        while True:
+            cells.add((x, y))
+            if x == x1 and y == y1:
+                break
+            if error > 0:
+                x += x_inc
+                error -= dy
+            else:
+                y += y_inc
+                error += dx
+            
+        return cells
+            
     def get_unvisited_directions(self):
         """Get list of available directions that lead to unvisited cells."""
         possible_moves = []
@@ -514,6 +536,67 @@ class InsectClient:
         
         return f"{header}\n{separator}\n" + "\n".join(rows)
 
+    def view_insects_world(self):
+        """Converts the visited cells and detected objects into a visual grid representation."""
+
+        if len(self.visited_cells) == 0:
+            return "No cells visited yet."
+        
+        # Define the grid boundaries
+        min_x = max(-100, min(x for x, _ in self.visited_cells) - 5)
+        max_x = min(100, max(x for x, _ in self.visited_cells) + 5)
+        min_y = max(-100, min(y for _, y in self.visited_cells) - 5) 
+        max_y = min(100, max(y for _, y in self.visited_cells) + 5)
+
+        # Create empty grid
+        grid = {}
+        for x in range(min_x, max_x + 1):
+            for y in range(min_y, max_y + 1):
+                grid[(x,y)] = '.'  # Default empty cell
+
+        # Mark visited cells
+        for x, y in self.visited_cells:
+            grid[(x,y)] = '#'  # Mark visited with #
+
+        # if self.detection_history:
+        #     for detection in self.detection_history:
+        #         x, y = detection['position']
+        #         grid[(x,y)] = 'X'  # Mark detected object with X
+        #         x, y = detection['frame_location'][0]  # Assuming frame_location is ((x,y), size)
+        #         symbol = detection['class_name'][0].upper()  # First letter of class name
+        #         grid[(int(x),int(y))] = symbol
+
+        # Add detected objects
+        if hasattr(self, 'detection_history'):
+            for detection in self.detection_history:
+                x, y = detection.frame_location 
+                print(detection.frame_location)
+                symbol = detection.object_class[0].upper()  # First letter of class name
+                grid[(int(x),int(y))] = symbol
+
+        # Add current position
+        curr_x, curr_y = int(self.position[0]), int(self.position[1])
+        grid[(curr_x,curr_y)] = '@'  # Mark current position with @
+
+        # Convert to string representation
+        result = f"World Map ({min_x},{min_y}) to ({max_x},{max_y})\n"
+        result += "@ = Current Position, # = Visited, . = Unexplored\n"
+        result += "Letters indicate detected objects (first letter of class name)\n\n"
+
+        # Build grid rows
+        for y in range(max_y, min_y-1, -1):  # Reverse y to match coordinate system
+            row = f"{y:3d} "  # Y-axis labels
+            for x in range(min_x, max_x+1):
+                row += grid.get((x,y), ' ')
+            result += row + '\n'
+        
+        # Add x-axis labels
+        result += "    " + "".join(['-' if x < 0 else '+' for x in range(min_x, max_x+1)]) + '\n'
+        result += "    " + "".join([f"{abs(x)//10}" for x in range(min_x, max_x+1)]) + '\n'
+        result += "    " + "".join([f"{abs(x)%10}" for x in range(min_x, max_x+1)])
+
+        return result
+
     async def llm_explore(self, channel, config):
         """Performs exploration by spinning randomly and moving forward."""
         if not self.tcp_flag or not self.servo_power:
@@ -525,7 +608,7 @@ class InsectClient:
             frame_location = (int(self.position[0]), int(self.position[1]))
 
             my_history = ''
-
+            my_history_full = ''
             if len(self.visited_cells) > 0:
                 if len(self.visited_cells) > 8:
                     # Calculate the logarithm of the size of the list (base 10)
@@ -540,14 +623,21 @@ class InsectClient:
                     for pos in random_selection:
                         my_history += f"({pos[0]}, {pos[1]})" + '\n'
                 else:
-                    for pos in self.visited_cells:
+                    for pos in sorted(self.visited_cells):
                         my_history += f"({pos[0]}, {pos[1]})" + '\n'
+                for pos in sorted(self.visited_cells):
+                    my_history_full += f"({pos[0]}, {pos[1]})" + '\n'
+                
 
             my_world = self.detection_history_to_string()
+            visited_world = self.view_insects_world()  # Get the visited world                                                          
 
             instruction = f'''
+<overview>
 You are an insect. You can issue the following commands. Each uses a variant of CMD_MOVE, to move, rotate or stop.
+</overview>
 
+<commands>
 To rotate:
 
     CMD_MOVE#2#0#0#8#90
@@ -565,89 +655,119 @@ Stop movement:
     CMD_MOVE#1#0#0#8#0
     
 NOTE THAT ALL VALID COMMANDS COMMENCE WITH 'CMD_MOVE'. DO NOT USE 'CMD_ROTATE'. ALWAYS TERMINATE WITH STOP: 'CMD_MOVE#1#0#0#8#0'.
+</commands>
 
-This is the rough history of your movement: {my_history}
+<map>
+Here is a rough map of your movement. The '@' symbol is your current location. 
 
-And here is the world you have discovered so far:
+{visited_world}
+</map>
+
+<objects>
+And here is the list of objects you have discovered so far:
 
 {my_world}
+<objects>
 
+<instruction>
 Think about where you have been and what you have seen. Where should you go next? You really want to visit new locations, even if it means choosing directions that are not at 90 degree angles.
+</instruction>
 
-Remember your world is a 2D grid, with coordinates between (-100, -100) and (100, 100). Don't try to visit locations outside of this grid. Vary things up; use random angles and distances if you're getting stuck, or head for home (0, 0).
+<notes>
+Remember your world is a 2D grid, with coordinates between (-100, -100) and (100, 100). Don't try to visit locations outside of this grid. 
 
-IMPORTANT: But review the objects you have seen and whether you want to move toward or away from them. 
+IMPORTANT: But review the objects you have seen. Choose whether you want to move toward or away from them. But never stay too long in one spot. Explore your world, and use random angles and distances if you're getting stuck.
 
 To travel to where you want to go next, you need to issue a sequence of commands using the syntax above: rotate, move forward, stop. Each command should be separated by a line break.
 
 ONLY OUTPUT THE COMMANDS THEMSELVES. PRINT EACH COMMAND ON A NEW LINE. THE COMMAND SHOULD BEGIN AT THE START OF THE LINE. DO NOT ADD OTHER CHARACTERS. 
 
 REMEMBER: to NOT use CMD_ROTATE, but instead a variant of CMD_MOVE#2.
-
+</notes>
 '''
 
             reasoning, response = await llm_message(self, instruction, config.llm_server)         
-            print("my_history", my_history)
-            print("my_world", my_world)
             # print(instruction)
             # print(response)
             if reasoning:
                 print("reasoning", reasoning[0:100])
 
+
+            print(visited_world)
+            # print(self.position)
+            # print("my_history_full", my_history_full)
+            # print("my_world", my_world)
+
             if response is not None: 
                 for command in response.split('\n'):
                     command = command.lstrip('`*').upper()
+                    print(command)
                     if command.upper().startswith('CMD_MOVE'):
                         if command.startswith('CMD_MOVE#1'):
                             if self.is_path_clear():
                                 self.send_command(command)
-                                self.update_position(('w', None), self.exploration_duration)
+                                # self.update_position(('w', None), self.exploration_duration)
+                                start_pos = self.position
+                                try:
+                                    value = command.split('#')[3]
+                                    distance = int(value)
+                                except Exception as e:
+                                    # handle any exception
+                                    distance = self.move_speed * self.exploration_duration
+
+                                # Calculate new position based on current orientation
+                                angle_rad = math.radians(self.orientation)
+                                dx = distance * math.sin(angle_rad)
+                                dy = distance * math.cos(angle_rad)
+                                new_position = (self.position[0] + dx, self.position[1] + dy)
+
+                                # Calculate all cells between start and end position using Bresenham's line algorithm
+                                start_cell = (int(start_pos[0]), int(start_pos[1]))
+                                end_cell = (int(new_position[0]), int(new_position[1]))
+                                line_cells = self.get_line_cells(start_cell[0], start_cell[1], end_cell[0], end_cell[1])
+                                
+                                test_point = start_cell
+                                for cell in line_cells:
+                                    test_point = (int(cell[0]), int(cell[1]))
+                                    matches = find_objects_at_point(test_point, objects_in_world)
+                                    # print(test_point)
+                                    # print(matches)
+                                    
+                                    if matches:
+                                        print(f"Point {test_point} found in objects:")
+                                        for obj in matches:
+                                            print(f"- {obj['class_name']} (confidence: {obj['confidence']})")
+                                            class_name = obj['class_name']
+                                            confidence = obj['confidence']
+                                            client = self
+                                            object_not_seen_before = await handle_object_detection_no_movement(channel, class_name, test_point, confidence, None, client, config)
+                                            if object_not_seen_before:
+                                                if config.discord_integration:
+                                                    visited_world = self.view_insects_world()  # Get the visited world                                                          
+                                                    await post(channel, f"```\n{visited_world}\n```" )
+
+                                        # Stop moving when an object is detected
+                                        break
+
+                                    self.visited_cells.add(test_point)
+                                    self.position = test_point
+                                
                                 # await asyncio.sleep(self.exploration_duration)
                                 await asyncio.sleep(0.1)
                                 self.send_command("CMD_MOVE#1#0#0#8#0\n")
+
                         elif command.startswith('CMD_MOVE#2'):
                             spin_angle = float(command.split('#')[5])  # Extract spin angle from last parameter
                             if spin_angle is not None:
                                 spin_duration = abs(spin_angle) / 45  # Adjust this value based on actual robot speed
+                                print(self.orientation, spin_angle)
                                 # await asyncio.sleep(spin_duration)
                                 await asyncio.sleep(0.1)
-                                self.update_position(('spin', spin_angle), spin_duration)
+                                self.orientation = (self.orientation + spin_angle) % 360
                                 self.send_command("CMD_MOVE#1#0#0#8#0\n")
 
                 await asyncio.sleep(0.1)
    
-   
-            test_point = (int(self.position[0]), int(self.position[1]))
-            matches = find_objects_at_point(test_point, objects_in_world)
-            print(test_point)
-            print(matches)
-
-            if matches:
-                print(f"Point {test_point} found in objects:")
-                for obj in matches:
-                    print(f"- {obj['class_name']} (confidence: {obj['confidence']})")
-                    class_name = obj['class_name']
-                    frame_location = obj['frame_location'][0]
-                    confidence = obj['confidence']
-                    client = self
-                    object_not_seen_before = await handle_object_detection_no_movement(channel, class_name, frame_location, confidence, None, client, config)
-                    print(object_not_seen_before)
-            # Add current position to visited cells
-            cell = (int(self.position[0]),
-                int(self.position[1]))
-            self.visited_cells.add(cell)
-            
-            # Store movement in path
-            movement = {
-                'movement': 'explore',
-                'spin_angle': 0,
-                'moved_forward': self.is_path_clear(),
-                'position': self.position,
-                'orientation': self.orientation,
-                'timestamp': time.time()
-            }
-            self.exploration_path.append(movement)
-
         except Exception as e:
             print(f"Error during exploration: {e}")
             # Ensure robot stops on error
@@ -1090,7 +1210,7 @@ async def handle_object_detection_no_movement(channel, class_name, frame_locatio
     )
 
     # Add to history if it's a new object
-    if not any(d.object_class == class_name for d in insect_client.detection_history):
+    if not any(d.frame_location  == frame_location for d in insect_client.detection_history):
         insect_client.detection_history.append(detection)
         what_ive_seen.append(class_name)
         object_not_seen_before = True
@@ -1324,6 +1444,7 @@ class ConfigManager:
         self.video_enabled = True
         self.show_video = True
         self.detection_enabled = False
+        self.print_help_on_start = False
         self.post_images = True
         self.world_config = None
         
@@ -1354,6 +1475,7 @@ class ConfigManager:
         print(f"  Video Enabled: {self.video_enabled}")
         print(f"  SHow Video: {self.show_video}")
         print(f"  Detection Enabled: {self.detection_enabled}")
+        print(f"  Print Help on Start: {self.print_help_on_start}")
         print(f"  Post Images: {self.post_images}")
         print(f"  World Config: {self.world_config}")
 
@@ -1371,6 +1493,7 @@ class ConfigManager:
                 self.video_enabled = config.get('video_enabled', self.video_enabled)
                 self.show_video = config.get('show_video', self.show_video)
                 self.detection_enabled = config.get('detection_enabled', self.detection_enabled)
+                self.print_help_on_start = config.get('print_help_on_start', self.print_help_on_start)
                 self.post_images = config.get('post_images', self.post_images)
                 self.world_config = config.get('world_config', self.world_config)
         except Exception as e:
@@ -1386,6 +1509,7 @@ class ConfigManager:
             'video_enabled': self.video_enabled,
             'show_video': self.show_video,
             'detection_enabled': self.detection_enabled,
+            'print_help_on_start': self.print_help_on_start,
             'post_images': self.post_images,
             'world_config': self.world_config
         }
@@ -1395,11 +1519,12 @@ class ConfigManager:
 
 class KeyboardController:
 
-    def __init__(self, insect_control: 'InsectControl', active_tasks=None, discord_client=None, llm_server=None):
+    def __init__(self, insect_control: 'InsectControl', active_tasks=None, discord_client=None, llm_server=None, config=None):
         self.control = insect_control
         self.active_tasks = active_tasks or []
         self.discord_client = discord_client
         self.llm_server = llm_server
+        self.config = config
         self.commands = {
             'w': ('Move forward', self.control.handle_movement),
             's': ('Move backward', self.control.handle_movement),
@@ -1592,7 +1717,9 @@ class KeyboardController:
     
     async def input_loop(self):
         """Main input loop for keyboard control."""
-        self.print_help()
+        print(self.config.print_help_on_start)
+        if self.config.print_help_on_start:
+            self.print_help()
         while self.running:
             cmd = await asyncio.get_event_loop().run_in_executor(None, input, "Enter command: ")
             if cmd in self.commands:
@@ -1728,13 +1855,14 @@ def setup_discord(settings: DiscordSettings, insect_controller: 'InsectControl',
             return
         
         try:
-            help_text = "Available commands:\n```\n"
-            for key, (desc, _) in keyboard_controller.commands.items():
-                if key not in ['esc', '!']:  # Skip certain commands
-                    help_text += f"{key} - {desc}\n"
-            help_text += "```"
-            
-            await channel.send('🤖 Robot control system online!\n' + help_text)
+            if config.print_help_on_start:
+                help_text = "Available commands:\n```\n"
+                for key, (desc, _) in keyboard_controller.commands.items():
+                    if key not in ['esc', '!']:  # Skip certain commands
+                        help_text += f"{key} - {desc}\n"
+                help_text += "```"
+                
+                await channel.send('🤖 Robot control system online!\n' + help_text)
             discord_ready.set()
         except Exception as e:
             print(f"Error sending Discord startup message: {e}")
@@ -1973,7 +2101,6 @@ async def main():
         return
     
     # Load objects
-    print(config)
     load_objects_in_world(config.world_config)
 
     # Store tasks for cleanup
@@ -1983,7 +2110,7 @@ async def main():
     
     try:
         # Set up keyboard control
-        keyboard = KeyboardController(insect_controller, active_tasks, discord_client, config.llm_server)
+        keyboard = KeyboardController(insect_controller, active_tasks, discord_client, config.llm_server, config)
 
         # Create and add tasks
         if config.video_enabled:

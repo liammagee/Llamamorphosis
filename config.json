@@ -50,6 +50,7 @@
   "video_enabled": false,
   "show_video": false,
   "detection_enabled": false,
+  "print_help_on_start": false,
   "post_images": false,
   "world_config": "./world.json",
   "llm_server": {
