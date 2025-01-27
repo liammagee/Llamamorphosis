@@ -680,11 +680,11 @@ IMPORTANT: But review the objects you have seen. Choose whether you want to move
 
 To travel to where you want to go next, you need to issue a sequence of commands using the syntax above: rotate, move forward, stop. Each command should be separated by a line break.
 
-ONLY OUTPUT THE COMMANDS THEMSELVES. PRINT EACH COMMAND ON A NEW LINE. THE COMMAND SHOULD BEGIN AT THE START OF THE LINE. DO NOT ADD OTHER CHARACTERS. 
 
 REMEMBER: to NOT use CMD_ROTATE, but instead a variant of CMD_MOVE#2.
 </notes>
 '''
+# ONLY OUTPUT THE COMMANDS THEMSELVES. PRINT EACH COMMAND ON A NEW LINE. THE COMMAND SHOULD BEGIN AT THE START OF THE LINE. DO NOT ADD OTHER CHARACTERS. 
 
             reasoning, response = await llm_message(self, instruction, config.llm_server)         
             # print(instruction)
